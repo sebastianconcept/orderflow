@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+**/target
+
+# Cargo lockfile is often committed for binaries, but can be ignored for libraries.
+# Keep it for now because this workspace is an application crate.
+Cargo.lock
+
+# Local environment and editor files
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+
+# Miscellaneous generated files
+*.log
+
+.kilo

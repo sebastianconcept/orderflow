@@ -1,0 +1,8 @@
+[package]
+name = "engine-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engine-types = { path = "../engine-types" }
+tokio = { version = "1", features = ["full"] }

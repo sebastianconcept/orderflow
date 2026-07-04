@@ -1,0 +1,8 @@
+[package]
+name = "output"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engine-types = { path = "../engine-types" }
+protocol = { path = "../protocol" }

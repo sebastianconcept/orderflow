@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/engine-core",
+    "crates/engine-gloomio",
+    "crates/engine-tokio",
+    "crates/engine-types",
+    "crates/input",
+    "crates/output",
+    "crates/scheduler",
+    "crates/sequencer",
+    "crates/screener",
+]
