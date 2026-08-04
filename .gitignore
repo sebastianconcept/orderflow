@@ -1,19 +1,39 @@
 # Rust build artifacts
-/target
-**/target
+/target/
+**/target/
 
-# Cargo lockfile is often committed for binaries, but can be ignored for libraries.
-# Keep it for now because this workspace is an application crate.
-Cargo.lock
+# Per-crate target dirs (see crates/*/ .cargo/config.toml) live under /target/
 
-# Local environment and editor files
+# Application workspace: commit Cargo.lock for reproducible builds (do not ignore)
+
+# rustfmt / tooling backups
+*.rs.bk
+
+# Profiling and coverage (if used)
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Local environment and secrets
 .env
 .env.*
+!.env.example
+
+# Editor and OS
 .vscode/
 .idea/
+*.swp
+*.swo
 .DS_Store
 
-# Miscellaneous generated files
+# Logs
 *.log
 
-.kilo
+# Kilo (local agent tooling; includes node_modules)
+.kilo/
+
+# Replay / simulation outputs (generated; keep fixtures under scenarios/ tracked)
+scenarios/generated/
+replay/out/

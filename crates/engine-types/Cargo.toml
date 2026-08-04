@@ -2,6 +2,6 @@
 name = "engine-types"
 version = "0.1.0"
 edition = "2021"
-
+license = "LicenseRef-Proprietary"
 [dependencies]
 rkyv = "0.7"

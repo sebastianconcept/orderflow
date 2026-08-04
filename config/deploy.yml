@@ -1,0 +1,79 @@
+# Kamal 2 deploy config — fill in before first deploy.
+# Docs: https://kamal-deploy.org/docs/configuration
+#
+# This image is built from the root Dockerfile (all pipeline binaries in /app/bin).
+# Add roles with different `cmd` / env as the pipeline grows; only the primary role
+# gets kamal-proxy by default unless you enable proxy on other roles.
+
+service: orderflow
+
+# image: your-registry/orderflow
+image: orderflow/orderflow
+
+servers:
+  # Primary role — matching engine (kamal-proxy attaches here by default)
+  web:
+    hosts:
+      - # e.g. 203.0.113.10
+    # When engine exposes HTTP on 80, proxy can route here. Override port if needed:
+    # proxy:
+    #   app_port: 8080
+
+  # Pipeline stages as additional roles (same image, different cmd)
+  input:
+    hosts:
+      - # same host or dedicated workers
+    cmd: input
+    proxy: false
+
+  screener:
+    hosts:
+      - #
+    cmd: screener
+    proxy: false
+
+  sequencer:
+    hosts:
+      - #
+    cmd: sequencer
+    proxy: false
+
+  scheduler:
+    hosts:
+      - #
+    cmd: scheduler
+    proxy: false
+
+  output:
+    hosts:
+      - #
+    cmd: output
+    proxy: false
+
+registry:
+  # username: your-docker-hub-user
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  context: ..
+  dockerfile: Dockerfile
+  # Or multi-arch when deploying to mixed hosts:
+  # multiarch: true
+
+env:
+  clear:
+    ORDERFLOW_ENV: production
+    RUST_LOG: info
+  secret:
+    - KAMAL_REGISTRY_PASSWORD
+
+# proxy:
+#   ssl: true
+#   host: orderflow.example.com
+
+# accessory:
+#   redis:
+#     image: redis:7
+#     host: # same as web
+#     port: 6379

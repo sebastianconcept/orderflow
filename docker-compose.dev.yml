@@ -1,0 +1,54 @@
+# Local development stack — hot path for replay scenarios and pipeline bring-up.
+# Start: just dev-up   Stop: just dev-down
+
+name: orderflow-dev
+
+x-pipeline-service: &pipeline-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  networks:
+    - orderflow
+  environment:
+    ORDERFLOW_ENV: development
+    ORDERFLOW_HOLD: "1"
+    RUST_LOG: ${RUST_LOG:-debug}
+  volumes:
+    - ./scenarios:/app/scenarios:ro
+    - ./replay/out:/app/replay/out
+  restart: unless-stopped
+
+services:
+  engine:
+    <<: *pipeline-service
+    container_name: orderflow-dev-engine
+    command: ["engine-core"]
+
+  input:
+    <<: *pipeline-service
+    container_name: orderflow-dev-input
+    command: ["input"]
+
+  screener:
+    <<: *pipeline-service
+    container_name: orderflow-dev-screener
+    command: ["screener"]
+
+  sequencer:
+    <<: *pipeline-service
+    container_name: orderflow-dev-sequencer
+    command: ["sequencer"]
+
+  scheduler:
+    <<: *pipeline-service
+    container_name: orderflow-dev-scheduler
+    command: ["scheduler"]
+
+  output:
+    <<: *pipeline-service
+    container_name: orderflow-dev-output
+    command: ["output"]
+
+networks:
+  orderflow:
+    name: orderflow-dev

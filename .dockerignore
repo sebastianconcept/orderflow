@@ -1,0 +1,12 @@
+/target/
+**/target/
+.git/
+.kilo/
+.vscode/
+.idea/
+*.log
+scenarios/generated/
+replay/out/
+.env
+.env.*
+!.env.example

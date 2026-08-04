@@ -1,0 +1,60 @@
+# Production-like local stack (compose). Remote deploy uses Kamal — see config/deploy.yml.
+# Start: just prod-up   Stop: just prod-down
+
+name: orderflow-prod
+
+x-pipeline-service: &pipeline-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  image: ${ORDERFLOW_IMAGE:-orderflow:prod}
+  networks:
+    - orderflow
+  environment:
+    ORDERFLOW_ENV: production
+    ORDERFLOW_HOLD: "0"
+    RUST_LOG: ${RUST_LOG:-info}
+  volumes:
+    - ./scenarios:/app/scenarios:ro
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512M
+
+services:
+  engine:
+    <<: *pipeline-service
+    container_name: orderflow-prod-engine
+    command: ["engine-core"]
+
+  input:
+    <<: *pipeline-service
+    container_name: orderflow-prod-input
+    command: ["input"]
+
+  screener:
+    <<: *pipeline-service
+    container_name: orderflow-prod-screener
+    command: ["screener"]
+
+  sequencer:
+    <<: *pipeline-service
+    container_name: orderflow-prod-sequencer
+    command: ["sequencer"]
+
+  scheduler:
+    <<: *pipeline-service
+    container_name: orderflow-prod-scheduler
+    command: ["scheduler"]
+
+  output:
+    <<: *pipeline-service
+    container_name: orderflow-prod-output
+    command: ["output"]
+
+networks:
+  orderflow:
+    name: orderflow-prod
