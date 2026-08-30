@@ -4,6 +4,9 @@
 //! prices in ticks. This ensures type safety and prevents accidental mixing
 //! of price values with other integer quantities.
 
+use crate::instrument_spec::{price_from_decimal_string, InstrumentSpec};
+use crate::PriceParseError;
+
 /// Price in ticks (i64).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Price(i64);
@@ -17,6 +20,37 @@ impl Price {
     /// Get the inner ticks value.
     pub fn inner(&self) -> i64 {
         self.0
+    }
+
+    /// Parse a decimal string into a Price (in ticks).
+    ///
+    /// This method parses a human-readable price string and converts it to
+    /// the exact integer tick count based on the instrument's display decimals.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The decimal string to parse (e.g., "100.25").
+    /// * `spec` - The instrument specification containing display decimal info.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Price)` - The parsed price in ticks.
+    /// * `Err(PriceParseError)` - If parsing fails (overflow, inexact fraction, etc.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use engine_types::{InstrumentSpec, Price, Quantity};
+    /// let spec = InstrumentSpec::new(1, Price::new(1), Quantity::new(1), 2, 0, None);
+    /// let price = Price::from_decimal_string("100.25", &spec)?;
+    /// assert_eq!(price.inner(), 10025);
+    /// # Ok::<(), engine_types::PriceParseError>(())
+    /// ```
+    pub fn from_decimal_string(
+        input: &str,
+        spec: &InstrumentSpec,
+    ) -> Result<Price, PriceParseError> {
+        price_from_decimal_string(input, spec)
     }
 }
 

@@ -4,6 +4,9 @@
 //! economic quantities in lots. This ensures type safety and prevents
 //! accidental mixing of quantity values with other integer types.
 
+use crate::instrument_spec::{quantity_from_decimal_string, InstrumentSpec};
+use crate::QuantityParseError;
+
 /// Quantity in lots (u128).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Quantity(u128);
@@ -17,6 +20,37 @@ impl Quantity {
     /// Get the inner lots value.
     pub fn inner(&self) -> u128 {
         self.0
+    }
+
+    /// Parse a decimal string into a Quantity (in lots).
+    ///
+    /// This method parses a human-readable quantity string and converts it to
+    /// the exact integer lot count based on the instrument's display decimals.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The decimal string to parse (e.g., "1.5").
+    /// * `spec` - The instrument specification containing display decimal info.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Quantity)` - The parsed quantity in lots.
+    /// * `Err(QuantityParseError)` - If parsing fails (overflow, inexact fraction, etc.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use engine_types::{InstrumentSpec, Price, Quantity};
+    /// let spec = InstrumentSpec::new(1, Price::new(1), Quantity::new(1), 0, 18, None);
+    /// let quantity = Quantity::from_decimal_string("1.5", &spec)?;
+    /// assert_eq!(quantity.inner(), 1500000000000000000);
+    /// # Ok::<(), engine_types::QuantityParseError>(())
+    /// ```
+    pub fn from_decimal_string(
+        input: &str,
+        spec: &InstrumentSpec,
+    ) -> Result<Quantity, QuantityParseError> {
+        quantity_from_decimal_string(input, spec)
     }
 }
 
