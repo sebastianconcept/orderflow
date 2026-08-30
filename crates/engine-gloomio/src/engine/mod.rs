@@ -5,7 +5,7 @@ pub mod config;
 
 pub use builder::GloomioMatchingEngineBuilder;
 use config::Config;
-use engine_types::{Order, Execution, MatchingEngine};
+use engine_types::{Execution, MatchingEngine, Order};
 
 pub struct Engine {
     config: Config,
