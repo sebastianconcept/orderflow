@@ -43,8 +43,9 @@ dependencies = [
 name = "engine-gloomio"
 version = "0.1.0"
 dependencies = [
+ "displaydoc",
  "engine-types",
- "protocol",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

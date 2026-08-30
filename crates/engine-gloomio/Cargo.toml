@@ -3,6 +3,8 @@ name = "engine-gloomio"
 version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-Proprietary"
+
 [dependencies]
 engine-types = { path = "../engine-types" }
-protocol = { path = "../protocol" }
+displaydoc = "0.2"
+thiserror = "2.0"
