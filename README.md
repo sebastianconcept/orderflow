@@ -19,17 +19,19 @@ Early scaffold. Workspace builds; core matching logic and replay tooling are not
 
 | Area | State |
 |------|--------|
-| Domain types (`Order`, `Execution`, `MatchingEngine`) | Defined in `engine-types` (rkyv-serializable) |
+| Domain types (`Order`, `Execution`, `MatchingEngine`) | Defined in `engine-types` (integer Price i64, Quantity u128) |
 | Engines (`engine-tokio`, `engine-gloomio`) | Placeholders (`process` is `todo!()`) |
 | Pipeline (`input`, `screener`, `sequencer`, `scheduler`, `output`) | Placeholder stages |
 | Event replay / simulation | Planned |
+
+Domain types use integer economic values (`Price` i64 ticks, `Quantity` u128 lots). The wire format is a compact packed journal (not JSON or rkyv).
 
 ## Workspace layout
 
 ```
 crates/
-  engine-types/     # Order, Execution, MatchingEngine trait
-  protocol/         # Wire-format layer (in flux)
+  engine-types/     # Order, EngineCommand, EngineEvent, MatchingEngine trait (integer types)
+  protocol/         # Packed journal: header + frames (commands 0x01–0x04, events 0x81–0x85)
   engine-tokio/     # Tokio-backed matcher
   engine-gloomio/   # Gloomio-backed matcher (runtime comparison)
   engine-core/      # Engine entry binary
