@@ -22,6 +22,14 @@ impl Price {
         self.0
     }
 
+    /// Create a new Price from an i64 value.
+    ///
+    /// This is an alias for `Price::new` and provides a more explicit
+    /// name when constructing from raw i64 values in codec contexts.
+    pub fn from_i64(ticks: i64) -> Self {
+        Price::new(ticks)
+    }
+
     /// Parse a decimal string into a Price (in ticks).
     ///
     /// This method parses a human-readable price string and converts it to

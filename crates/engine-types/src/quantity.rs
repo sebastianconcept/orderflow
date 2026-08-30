@@ -22,6 +22,14 @@ impl Quantity {
         self.0
     }
 
+    /// Create a new Quantity from a u128 value.
+    ///
+    /// This is an alias for `Quantity::new` and provides a more explicit
+    /// name when constructing from raw u128 values in codec contexts.
+    pub fn from_u128(lots: u128) -> Self {
+        Quantity::new(lots)
+    }
+
     /// Parse a decimal string into a Quantity (in lots).
     ///
     /// This method parses a human-readable quantity string and converts it to
