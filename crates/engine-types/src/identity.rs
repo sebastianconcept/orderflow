@@ -122,6 +122,7 @@ mod tests {
 
     #[test]
     fn order_id_new_round_trips_inner_u64() {
+        // Given: a u64 value representing an order identifier
         // Given a u64 value
         let original_value: u64 = 12345;
 

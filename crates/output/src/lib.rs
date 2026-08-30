@@ -13,3 +13,9 @@ impl OutputSink {
         // TODO: real output implementation
     }
 }
+
+impl Default for OutputSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}

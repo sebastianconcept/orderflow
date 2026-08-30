@@ -13,3 +13,9 @@ impl Screener {
         true
     }
 }
+
+impl Default for Screener {
+    fn default() -> Self {
+        Self::new()
+    }
+}

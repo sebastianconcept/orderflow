@@ -7,6 +7,7 @@ pub use builder::GloomioMatchingEngineBuilder;
 use config::Config;
 use engine_types::{Execution, MatchingEngine, Order};
 
+#[allow(dead_code)]
 pub struct Engine {
     config: Config,
 }
@@ -15,7 +16,7 @@ impl Engine {
         Self { config }
     }
 
-    pub fn default() -> Self {
+    pub fn default_engine() -> Self {
         Self {
             config: Config::default(),
         }

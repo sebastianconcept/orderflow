@@ -11,3 +11,9 @@ impl InputGateway {
         None
     }
 }
+
+impl Default for InputGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}

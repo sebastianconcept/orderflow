@@ -20,10 +20,16 @@ impl Config {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_config() -> Self {
         Config {
             name: "Default gloomio Matching Engine".to_string(),
             version: "0.1.0".to_string(),
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::default_config()
     }
 }

@@ -17,3 +17,9 @@ impl Sequencer {
         order
     }
 }
+
+impl Default for Sequencer {
+    fn default() -> Self {
+        Self::new()
+    }
+}

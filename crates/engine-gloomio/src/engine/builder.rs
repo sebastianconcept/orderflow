@@ -4,6 +4,6 @@ pub struct GloomioMatchingEngineBuilder;
 
 impl GloomioMatchingEngineBuilder {
     pub fn build() -> Engine {
-        Engine::default()
+        Engine::default_engine()
     }
 }

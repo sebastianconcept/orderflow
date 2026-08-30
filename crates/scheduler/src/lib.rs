@@ -13,3 +13,9 @@ impl Scheduler {
         order
     }
 }
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
