@@ -1,39 +1,11 @@
 //! Engine shared types
+//!
+//! This module provides core domain types and traits for the matching engine.
+//! For order-specific types, see the [`order`] module.
 
-use crate::identity::{AccountId, ClientOrderId, InstrumentId, OrderId};
-use crate::price::Price;
+use crate::identity::OrderId;
+use crate::order::Order;
 use crate::quantity::Quantity;
-
-/// Side of an order (buy or sell).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Side {
-    /// Buy side
-    Buy,
-    /// Sell side
-    Sell,
-}
-
-/// Type of order (limit or market).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum OrderType {
-    /// Limit order with a specific price
-    Limit,
-    /// Market order executed at best available price
-    Market,
-}
-
-/// Order representation with integer fields.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct Order {
-    pub id: OrderId,
-    pub client_order_id: ClientOrderId,
-    pub instrument_id: InstrumentId,
-    pub account_id: AccountId,
-    pub side: Side,
-    pub order_type: OrderType,
-    pub price: Price,
-    pub quantity: Quantity,
-}
 
 /// Execution result from a matched order.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -43,7 +15,39 @@ pub struct Execution {
 }
 
 /// Trait that all matching engine implementations must provide.
+///
+/// # Notes
+///
+/// This trait has been updated to use [`EngineCommand`] and append to a caller-owned buffer
+/// of [`EngineEvent`]. The old signature is no longer present.
+///
+/// # Examples
+///
+/// ```ignore
+/// use engine_types::{MatchingEngine, Order, Execution};
+///
+/// struct DummyEngine;
+///
+/// impl MatchingEngine for DummyEngine {
+///     fn process(&mut self, order: Order) -> Vec<Execution> {
+///         // TODO: implement actual matching logic
+///         todo!()
+///     }
+/// }
+///
+/// // let mut engine = DummyEngine;
+/// // let order = Order::new(0, 0, 0, 0, engine_types::Side::Buy, engine_types::OrderType::Limit, engine_types::Price::new(100), engine_types::Quantity::new(10));
+/// // let _executions = engine.process(order);
+/// ```
 pub trait MatchingEngine {
-    /// Process an incoming order and return any executions produced.
+    /// Process an order and return any executions produced.
+    ///
+    /// # Arguments
+    ///
+    /// * `order` - The order to process
+    ///
+    /// # Returns
+    ///
+    /// A vector of executions produced by processing the order.
     fn process(&mut self, order: Order) -> Vec<Execution>;
 }
