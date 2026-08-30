@@ -1,5 +1,6 @@
 pub mod engine;
-pub mod types;
+pub mod error;
 
-// pub use engine::TokioEngine;
-// pub use types::Engine;
+pub use engine::config::Config;
+pub use engine::{Engine, TokioMatchingEngineBuilder};
+pub use error::Error;
