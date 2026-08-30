@@ -3,8 +3,9 @@
 //! This module provides core domain types and traits for the matching engine.
 //! For order-specific types, see the [`order`] module.
 
+use crate::engine_command::EngineCommand;
+use crate::engine_event::EngineEvent;
 use crate::identity::OrderId;
-use crate::order::Order;
 use crate::quantity::Quantity;
 
 /// Execution result from a matched order.
@@ -16,38 +17,57 @@ pub struct Execution {
 
 /// Trait that all matching engine implementations must provide.
 ///
-/// # Notes
+/// The matching engine processes [`EngineCommand`]s and appends resulting
+/// [`EngineEvent`]s to a caller-owned buffer. This signature supports both
+/// live traffic and replay scenarios where commands are injected into the engine.
 ///
-/// This trait has been updated to use [`EngineCommand`] and append to a caller-owned buffer
-/// of [`EngineEvent`]. The old signature is no longer present.
-///
-/// # Examples
+/// # Usage
 ///
 /// ```ignore
-/// use engine_types::{MatchingEngine, Order, Execution};
+/// use engine_types::{EngineCommand, EngineEvent, MatchingEngine};
 ///
-/// struct DummyEngine;
+/// struct MyEngine;
 ///
-/// impl MatchingEngine for DummyEngine {
-///     fn process(&mut self, order: Order) -> Vec<Execution> {
-///         // TODO: implement actual matching logic
+/// impl MatchingEngine for MyEngine {
+///     fn process(&mut self, command: EngineCommand, out: &mut Vec<EngineEvent>) {
+///         // Process the command and append events to `out`
+///         // out.push(EngineEvent::Accepted { ... });
 ///         todo!()
 ///     }
 /// }
 ///
-/// // let mut engine = DummyEngine;
-/// // let order = Order::new(0, 0, 0, 0, engine_types::Side::Buy, engine_types::OrderType::Limit, engine_types::Price::new(100), engine_types::Quantity::new(10));
-/// // let _executions = engine.process(order);
+/// let mut engine = MyEngine;
+/// let command = EngineCommand::New {
+///     account_id: AccountId::new(1),
+///     client_order_id: ClientOrderId::new(7),
+///     instrument_id: InstrumentId::new(2),
+///     side: Side::Buy,
+///     order_type: OrderType::Limit,
+///     price: Price::new(100),
+///     quantity: Quantity::new(10),
+/// };
+///
+/// let mut events: Vec<EngineEvent> = Vec::new();
+/// engine.process(command, &mut events);
+/// // `events` now contains the result of processing `command`
 /// ```
+///
+/// # Notes
+///
+/// The trait signature uses `&mut Vec<EngineEvent>` to allow the engine to append
+/// events without ownership transfer. Callers should [`Vec::clear()`] the buffer
+/// before each command if they want only that command's events.
 pub trait MatchingEngine {
-    /// Process an order and return any executions produced.
+    /// Process an engine command and append resulting events to the output buffer.
     ///
     /// # Arguments
     ///
-    /// * `order` - The order to process
+    /// * `command` - The command to process (New, CancelByOrder, CancelByClient, or Replace)
+    /// * `out` - Caller-owned buffer to append events to
     ///
-    /// # Returns
+    /// # Behavior
     ///
-    /// A vector of executions produced by processing the order.
-    fn process(&mut self, order: Order) -> Vec<Execution>;
+    /// This method appends [`EngineEvent`]s to `out` based on the command type and
+    /// engine state. It does not return a `Vec` to avoid unnecessary allocation.
+    fn process(&mut self, command: EngineCommand, out: &mut Vec<EngineEvent>);
 }

@@ -5,7 +5,7 @@ pub mod config;
 
 pub use builder::GloomioMatchingEngineBuilder;
 use config::Config;
-use engine_types::{Execution, MatchingEngine, Order};
+use engine_types::{EngineCommand, EngineEvent, MatchingEngine};
 
 #[allow(dead_code)]
 pub struct Engine {
@@ -31,7 +31,7 @@ impl Engine {
 }
 
 impl MatchingEngine for Engine {
-    fn process(&mut self, _order: Order) -> Vec<Execution> {
+    fn process(&mut self, _command: EngineCommand, _out: &mut Vec<EngineEvent>) {
         // TODO: real implementation
         todo!("Implement gloomio matching engine logic");
     }

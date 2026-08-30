@@ -3,7 +3,7 @@ pub mod config;
 
 pub use builder::*;
 pub use config::Config;
-use engine_types::{Execution, MatchingEngine, Order};
+use engine_types::{EngineCommand, EngineEvent, MatchingEngine};
 
 /// Default implementation that does nothing – placeholder.
 #[allow(dead_code)]
@@ -31,7 +31,7 @@ impl Engine {
 }
 
 impl MatchingEngine for Engine {
-    fn process(&mut self, _order: Order) -> Vec<Execution> {
+    fn process(&mut self, _command: EngineCommand, _out: &mut Vec<EngineEvent>) {
         todo!("Implement tokio matching engine logic");
     }
 }
