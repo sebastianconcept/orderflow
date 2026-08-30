@@ -201,7 +201,6 @@ name = "screener"
 version = "0.1.0"
 dependencies = [
  "engine-types",
- "protocol",
 ]
 
 [[package]]
