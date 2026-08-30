@@ -1,6 +1,6 @@
-use engine_tokio::engine::TokioMatchingEngineBuilder;
+use engine_core::run;
 
 fn main() {
-    let _engine = TokioMatchingEngineBuilder::build();
+    let _engine = run();
     println!("engine-core program started");
 }
