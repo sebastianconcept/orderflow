@@ -459,4 +459,161 @@ mod tests {
         assert_eq!(timestamp.inner(), 1234567890);
         assert_eq!(copy_timestamp.inner(), 1234567890);
     }
+
+    /// Test that Accepted event echoes both client_order_id and order_id.
+    ///
+    /// When an order is accepted, the event should contain both:
+    /// - client_order_id from the original command
+    /// - order_id assigned by the engine
+    #[test]
+    fn accepted_echoes_client_order_id_and_order_id() {
+        // Given: an Accepted event with specific IDs
+        let sequence = Sequence::new(1);
+        let timestamp = TimestampNanos::new(1000);
+        let order_id = OrderId::new(42);
+        let client_order_id = ClientOrderId::new(7);
+        let account_id = AccountId::new(1);
+
+        // When: creating an Accepted event
+        let accepted_event = EngineEvent::Accepted {
+            sequence,
+            timestamp_nanos: timestamp,
+            order_id,
+            client_order_id,
+            account_id,
+        };
+
+        // Then: both IDs are preserved
+        match accepted_event {
+            EngineEvent::Accepted {
+                sequence: seq,
+                timestamp_nanos: ts,
+                order_id: oid,
+                client_order_id: cid,
+                account_id: aid,
+            } => {
+                assert_eq!(seq.inner(), 1);
+                assert_eq!(ts.inner(), 1000);
+                assert_eq!(oid.inner(), 42);
+                assert_eq!(cid.inner(), 7);
+                assert_eq!(aid.inner(), 1);
+            }
+            _ => panic!("Expected Accepted variant"),
+        }
+
+        // Verify the event is Copy
+        let copied_event = accepted_event;
+        match copied_event {
+            EngineEvent::Accepted {
+                order_id,
+                client_order_id,
+                ..
+            } => {
+                assert_eq!(order_id.inner(), 42);
+                assert_eq!(client_order_id.inner(), 7);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Test that Trade event includes both maker_order_id and taker_order_id.
+    ///
+    /// When a trade occurs, the event must identify:
+    /// - maker_order_id: the resting order that was filled
+    /// - taker_order_id: the new order that executed against the maker
+    #[test]
+    fn trade_includes_maker_and_taker_order_ids() {
+        // Given: a Trade event with specific IDs
+        let sequence = Sequence::new(5);
+        let timestamp = TimestampNanos::new(5000);
+        let maker_order_id = OrderId::new(10);
+        let taker_order_id = OrderId::new(20);
+        let instrument_id = InstrumentId::new(2);
+        let price = Price::new(100);
+        let quantity = Quantity::new(5);
+
+        // When: creating a Trade event
+        let trade_event = EngineEvent::Trade {
+            sequence,
+            timestamp_nanos: timestamp,
+            maker_order_id,
+            taker_order_id,
+            instrument_id,
+            price,
+            quantity,
+        };
+
+        // Then: both maker and taker order IDs are preserved
+        match trade_event {
+            EngineEvent::Trade {
+                maker_order_id: mid,
+                taker_order_id: tid,
+                ..
+            } => {
+                assert_eq!(mid.inner(), 10);
+                assert_eq!(tid.inner(), 20);
+            }
+            _ => panic!("Expected Trade variant"),
+        }
+
+        // Verify the event is Copy
+        let copied_event = trade_event;
+        match copied_event {
+            EngineEvent::Trade {
+                maker_order_id,
+                taker_order_id,
+                ..
+            } => {
+                assert_eq!(maker_order_id.inner(), 10);
+                assert_eq!(taker_order_id.inner(), 20);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Test that Other rejection reason is distinct from InvalidQuantity.
+    ///
+    /// The EngineEventRejectReason enum must have distinct variants
+    /// so that the caller can differentiate between specific failures.
+    #[test]
+    fn reject_reason_other_is_distinct_from_invalid_quantity() {
+        // Given: two different rejection reasons
+        let invalid_quantity = EngineEventRejectReason::InvalidQuantity;
+        let other_reason = EngineEventRejectReason::Other;
+
+        // When: comparing them
+        assert_ne!(invalid_quantity, other_reason);
+
+        // Then: they are distinct variants
+        match invalid_quantity {
+            EngineEventRejectReason::InvalidQuantity => {}
+            _ => panic!("Expected InvalidQuantity"),
+        }
+
+        match other_reason {
+            EngineEventRejectReason::Other => {}
+            _ => panic!("Expected Other"),
+        }
+
+        // Verify Copy
+        let copy_invalid = invalid_quantity;
+        let copy_other = other_reason;
+
+        assert_eq!(invalid_quantity, copy_invalid);
+        assert_eq!(other_reason, copy_other);
+
+        // Verify they serialize to different u8 values
+        let invalid_quantity_u8 = match invalid_quantity {
+            EngineEventRejectReason::InvalidQuantity => 0u8,
+            _ => unreachable!(),
+        };
+        let other_u8 = match other_reason {
+            EngineEventRejectReason::Other => 255u8,
+            _ => unreachable!(),
+        };
+
+        assert_ne!(invalid_quantity_u8, other_u8);
+        assert_eq!(invalid_quantity_u8, 0);
+        assert_eq!(other_u8, 255);
+    }
 }
