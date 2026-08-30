@@ -1,6 +1,8 @@
 //! Engine shared types
 
 use crate::identity::{AccountId, ClientOrderId, InstrumentId, OrderId};
+use crate::price::Price;
+use crate::quantity::Quantity;
 
 /// Side of an order (buy or sell).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -18,38 +20,6 @@ pub enum OrderType {
     Limit,
     /// Market order executed at best available price
     Market,
-}
-
-/// Price in ticks (i64).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Price(i64);
-
-impl Price {
-    /// Create a new Price from ticks.
-    pub fn new(ticks: i64) -> Self {
-        Price(ticks)
-    }
-
-    /// Get the inner ticks value.
-    pub fn inner(&self) -> i64 {
-        self.0
-    }
-}
-
-/// Quantity in lots (u128).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Quantity(u128);
-
-impl Quantity {
-    /// Create a new Quantity from lots.
-    pub fn new(lots: u128) -> Self {
-        Quantity(lots)
-    }
-
-    /// Get the inner lots value.
-    pub fn inner(&self) -> u128 {
-        self.0
-    }
 }
 
 /// Order representation with integer fields.
