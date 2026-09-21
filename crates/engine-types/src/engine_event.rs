@@ -1,215 +1,82 @@
-//! Engine events representing state transitions in the matching engine.
+//! State changes that a matching engine emits.
 //!
-//! This module provides the event types that the matching engine emits as a result
-//! of processing [`EngineCommand`]s. Events represent state changes such as order
-//! acceptance, rejection, cancellation, replacement, and trades.
-//!
-//! # Event Variants
-//!
-//! - [`EngineEvent::Accepted`]: An order has been accepted into the order book.
-//! - [`EngineEvent::Rejected`]: A command was rejected (e.g., invalid quantity, unknown instrument).
-//! - [`EngineEvent::Replaced`]: An order has been replaced with modified price/quantity.
-//! - [`EngineEvent::Canceled`]: An order has been canceled before execution.
-//! - [`EngineEvent::Trade`]: A trade occurred between a maker and taker order.
-//!
-//! # Event Lifecycle
-//!
-//! Events are appended by the [`MatchingEngine`] to a caller-owned buffer:
-//!
-//! ```
-//! use engine_types::{AccountId, ClientOrderId, EngineCommand, EngineEvent, InstrumentId, MatchingEngine, OrderType, Price, Quantity, Side};
-//!
-//! struct MyEngine;
-//!
-//! impl MatchingEngine for MyEngine {
-//!     fn process(&mut self, _command: EngineCommand, _out: &mut Vec<EngineEvent>) {
-//!         // TODO: implement actual matching logic
-//!     }
-//! }
-//!
-//! let mut engine = MyEngine;
-//! let command = EngineCommand::New {
-//!     account_id: AccountId::new(1),
-//!     client_order_id: ClientOrderId::new(7),
-//!     instrument_id: InstrumentId::new(2),
-//!     side: Side::Buy,
-//!     order_type: OrderType::Limit,
-//!     price: Price::new(100),
-//!     quantity: Quantity::new(10),
-//! };
-//!
-//! let mut events = Vec::new();
-//! engine.process(command, &mut events);
-//! // `events` now contains the result of processing `command`
-//! ```
-//!
-//! # Copy Semantics
-//!
-//! All event variants implement [`Copy`] because they contain only integer types that are `Copy`.
-//! This allows efficient event propagation without ownership transfer.
+//! When a caller observes matching, it uses this module so accept, reject, replace,
+//! cancel, and trade are distinct events. Each event carries EventSequence and the
+//! producing CommandSequence.
 
-use crate::identity::{AccountId, ClientOrderId, InstrumentId, OrderId};
+use crate::identity::{
+    AccountId, ClientOrderId, CommandSequence, EventSequence, InstrumentId, OrderId, TimestampNanos,
+};
 use crate::price::Price;
 use crate::quantity::Quantity;
 
-/// Reason why an engine event was rejected.
-///
-/// This is a closed enum representing all possible rejection reasons.
-/// Use this with [`EngineEvent::Rejected`] to communicate why a command failed.
-///
-/// # Wire Encoding
-///
-/// In the protocol, rejection reasons are encoded as `u8`:
-///
-/// - `0` → `InvalidQuantity`
-/// - `1` → `UnknownInstrument`
-/// - `2` → `OrderNotFound`
-/// - `3` → `InvalidPrice`
-/// - `255` → `Other`
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// EngineEventRejectReason is why a command did not change order state.
+/// When a Rejected event names the failure, it uses this type so the reason is a
+/// closed set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum EngineEventRejectReason {
-    /// The quantity in the command was invalid (e.g., zero, negative, or exceeds limits).
+    /// Quantity in the command was invalid.
     InvalidQuantity,
-    /// The instrument specified in the command is unknown to this engine.
+    /// Instrument in the command is unknown.
     UnknownInstrument,
-    /// The order ID referenced in a cancel or replace command does not exist.
+    /// Order in a cancel or replace command does not exist.
     OrderNotFound,
-    /// The price in the command is invalid (e.g., negative or exceeds tick limits).
+    /// Price in the command was invalid.
     InvalidPrice,
-    /// A rejection reason not covered by the above variants.
+    /// Rejection reason outside the named set.
     Other,
 }
 
-/// Engine event representing a state transition in the matching process.
-///
-/// Events are emitted by the [`MatchingEngine`] when processing [`EngineCommand`]s.
-/// Each event contains a sequence number and timestamp for ordering and auditing purposes.
-///
-/// # Event Types
-///
-/// - [`EngineEvent::Accepted`]: Order accepted into the order book.
-///   Contains: `sequence`, `timestamp_nanos`, `order_id`, `client_order_id`, `account_id`
-/// - [`EngineEvent::Rejected`]: Command rejected due to validation failure.
-///   Contains: `sequence`, `timestamp_nanos`, `client_order_id`, `reason`
-/// - [`EngineEvent::Replaced`]: Order replaced with new price/quantity.
-///   Contains: `sequence`, `timestamp_nanos`, `order_id`, `client_order_id`
-/// - [`EngineEvent::Canceled`]: Order canceled before execution.
-///   Contains: `sequence`, `timestamp_nanos`, `order_id`
-/// - [`EngineEvent::Trade`]: Matched execution between maker and taker.
-///   Contains: `sequence`, `timestamp_nanos`, `maker_order_id`, `taker_order_id`, `instrument_id`, `price`, `quantity`
-///
-/// # Usage
-///
-/// Events are appended to a caller-owned buffer by the [`MatchingEngine::process`] method:
-///
-/// ```
-/// use engine_types::{EngineCommand, EngineEvent};
-///
-/// let mut events: Vec<EngineEvent> = Vec::new();
-/// // engine.process(command, &mut events) appends to `events`
-/// ```
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// EngineEvent is a state change produced while processing a command.
+/// When a caller records matching, it uses this type so each variant carries
+/// EventSequence and the producing CommandSequence.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum EngineEvent {
-    /// An order has been accepted into the matching engine's order book.
-    ///
-    /// # Fields
-    ///
-    /// * `sequence` - Monotonically increasing sequence number for this session.
-    /// * `timestamp_nanos` - Timestamp when the order was accepted (nanoseconds).
-    /// * `order_id` - Engine-assigned unique identifier for the order.
-    /// * `client_order_id` - Client-assigned identifier from the original request.
-    /// * `account_id` - Identifier for the trading account that placed the order.
-    ///
-    /// # Notes
-    ///
-    /// This event is emitted when a [`EngineCommand::New`] command is successfully processed.
+    /// Accept of a NewLimit or NewMarket into the book.
+    /// The event correlates ClientOrderId with the engine OrderId.
     Accepted {
-        sequence: Sequence,
+        event_sequence: EventSequence,
+        command_sequence: CommandSequence,
         timestamp_nanos: TimestampNanos,
         order_id: OrderId,
         client_order_id: ClientOrderId,
         account_id: AccountId,
     },
 
-    /// A command was rejected due to validation or business rule failure.
-    ///
-    /// # Fields
-    ///
-    /// * `sequence` - Monotonically increasing sequence number for this session.
-    /// * `timestamp_nanos` - Timestamp when the rejection occurred (nanoseconds).
-    /// * `client_order_id` - Client-assigned identifier from the original request.
-    ///   For commands without a client order ID (e.g., `CancelByOrder`), this is `ClientOrderId(0)`.
-    /// * `reason` - The specific reason for rejection.
-    ///
-    /// # Notes
-    ///
-    /// This event is emitted when a command fails validation or business logic checks.
-    /// The `client_order_id` field allows the caller to correlate rejection with request,
-    /// even if the command type (e.g., `CancelByOrder`) doesn't normally carry a client ID.
+    /// Failure of a command to change order state.
+    /// The event correlates the request through ClientOrderId.
     Rejected {
-        sequence: Sequence,
+        event_sequence: EventSequence,
+        command_sequence: CommandSequence,
         timestamp_nanos: TimestampNanos,
         client_order_id: ClientOrderId,
         reason: EngineEventRejectReason,
     },
 
-    /// An order has been replaced with modified price and/or quantity.
-    ///
-    /// # Fields
-    ///
-    /// * `sequence` - Monotonically increasing sequence number for this session.
-    /// * `timestamp_nanos` - Timestamp when the replacement occurred (nanoseconds).
-    /// * `order_id` - Engine-assigned identifier for the original order.
-    /// * `client_order_id` - Client-assigned identifier from the REPLACE request
-    ///   (distinct from the original order's `client_order_id`).
-    ///
-    /// # Notes
-    ///
-    /// The `client_order_id` here is from the [`EngineCommand::Replace`] command,
-    /// not from the original [`EngineCommand::New`]. This allows tracking each
-    /// replace request independently.
+    /// Amend of price or quantity on a resting order.
+    /// The event tracks the replace through its fresh ClientOrderId.
     Replaced {
-        sequence: Sequence,
+        event_sequence: EventSequence,
+        command_sequence: CommandSequence,
         timestamp_nanos: TimestampNanos,
         order_id: OrderId,
         client_order_id: ClientOrderId,
     },
 
-    /// An order has been canceled before it could be executed.
-    ///
-    /// # Fields
-    ///
-    /// * `sequence` - Monotonically increasing sequence number for this session.
-    /// * `timestamp_nanos` - Timestamp when the cancellation occurred (nanoseconds).
-    /// * `order_id` - Engine-assigned identifier for the canceled order.
-    ///
-    /// # Notes
-    ///
-    /// This event is emitted when either [`EngineCommand::CancelByOrder`] or
-    /// [`EngineCommand::CancelByClient`] is successfully processed.
+    /// Removal of a resting order before a fill.
+    /// The event names the engine OrderId that left the book.
     Canceled {
-        sequence: Sequence,
+        event_sequence: EventSequence,
+        command_sequence: CommandSequence,
         timestamp_nanos: TimestampNanos,
         order_id: OrderId,
     },
 
-    /// A trade occurred between a maker and taker order.
-    ///
-    /// # Fields
-    ///
-    /// * `sequence` - Monotonically increasing sequence number for this session.
-    /// * `timestamp_nanos` - Timestamp when the trade occurred (nanoseconds).
-    /// * `maker_order_id` - Engine-assigned identifier for the resting order (maker).
-    /// * `taker_order_id` - Engine-assigned identifier for the new order (taker).
-    /// * `instrument_id` - Identifier for the tradable instrument.
-    /// * `price` - Trade price in ticks.
-    /// * `quantity` - Traded quantity in lots.
-    ///
-    /// # Notes
-    ///
-    /// This event is emitted when an incoming order matches with one or more resting orders.
+    /// Match between a maker order and a taker order.
+    /// The event names both order identities, the instrument, and the fill.
     Trade {
-        sequence: Sequence,
+        event_sequence: EventSequence,
+        command_sequence: CommandSequence,
         timestamp_nanos: TimestampNanos,
         maker_order_id: OrderId,
         taker_order_id: OrderId,
@@ -219,114 +86,53 @@ pub enum EngineEvent {
     },
 }
 
-/// Sequence number - monotonically increasing counter within a session.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Sequence(u64);
-
-impl Sequence {
-    /// Create a new Sequence from a raw u64 value.
-    pub fn new(id: u64) -> Self {
-        Sequence(id)
-    }
-
-    /// Get the inner u64 value.
-    pub fn inner(&self) -> u64 {
-        self.0
-    }
-}
-
-/// Timestamp in nanoseconds.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct TimestampNanos(u64);
-
-impl TimestampNanos {
-    /// Create a new TimestampNanos from a raw u64 value.
-    pub fn new(nanos: u64) -> Self {
-        TimestampNanos(nanos)
-    }
-
-    /// Get the inner u64 value.
-    pub fn inner(&self) -> u64 {
-        self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Test that EngineEvent variants implement Copy.
-    #[test]
-    fn engine_event_variants_implement_copy() {
-        // Test Accepted is Copy
-        let original_accepted = EngineEvent::Accepted {
-            sequence: Sequence::new(1),
+    fn assert_copy<T: Copy + PartialEq + std::fmt::Debug>(value: T) {
+        let copy = value;
+        assert_eq!(value, copy);
+    }
+
+    fn sample_accepted() -> EngineEvent {
+        EngineEvent::Accepted {
+            event_sequence: EventSequence::new(1),
+            command_sequence: CommandSequence::new(10),
             timestamp_nanos: TimestampNanos::new(1000),
             order_id: OrderId::new(42),
             client_order_id: ClientOrderId::new(7),
             account_id: AccountId::new(1),
-        };
-
-        let _copied_accepted = original_accepted;
-        match original_accepted {
-            EngineEvent::Accepted { sequence, .. } => {
-                assert_eq!(sequence.inner(), 1);
-            }
-            _ => unreachable!(),
         }
+    }
 
-        // Test Rejected is Copy
-        let original_rejected = EngineEvent::Rejected {
-            sequence: Sequence::new(2),
+    #[test]
+    fn engine_event_variants_implement_copy() {
+        // Given each EngineEvent variant
+        let accepted = sample_accepted();
+        let rejected = EngineEvent::Rejected {
+            event_sequence: EventSequence::new(2),
+            command_sequence: CommandSequence::new(11),
             timestamp_nanos: TimestampNanos::new(2000),
             client_order_id: ClientOrderId::new(7),
             reason: EngineEventRejectReason::InvalidQuantity,
         };
-
-        let _copied_rejected = original_rejected;
-        match original_rejected {
-            EngineEvent::Rejected { reason, .. } => {
-                assert_eq!(reason, EngineEventRejectReason::InvalidQuantity);
-            }
-            _ => unreachable!(),
-        }
-
-        // Test Replaced is Copy
-        let original_replaced = EngineEvent::Replaced {
-            sequence: Sequence::new(3),
+        let replaced = EngineEvent::Replaced {
+            event_sequence: EventSequence::new(3),
+            command_sequence: CommandSequence::new(12),
             timestamp_nanos: TimestampNanos::new(3000),
             order_id: OrderId::new(42),
             client_order_id: ClientOrderId::new(99),
         };
-
-        let _copied_replaced = original_replaced;
-        match original_replaced {
-            EngineEvent::Replaced {
-                client_order_id, ..
-            } => {
-                assert_eq!(client_order_id.inner(), 99);
-            }
-            _ => unreachable!(),
-        }
-
-        // Test Canceled is Copy
-        let original_canceled = EngineEvent::Canceled {
-            sequence: Sequence::new(4),
+        let canceled = EngineEvent::Canceled {
+            event_sequence: EventSequence::new(4),
+            command_sequence: CommandSequence::new(13),
             timestamp_nanos: TimestampNanos::new(4000),
             order_id: OrderId::new(42),
         };
-
-        let _copied_canceled = original_canceled;
-        match original_canceled {
-            EngineEvent::Canceled { order_id, .. } => {
-                assert_eq!(order_id.inner(), 42);
-            }
-            _ => unreachable!(),
-        }
-
-        // Test Trade is Copy
-        let original_trade = EngineEvent::Trade {
-            sequence: Sequence::new(5),
+        let trade = EngineEvent::Trade {
+            event_sequence: EventSequence::new(5),
+            command_sequence: CommandSequence::new(14),
             timestamp_nanos: TimestampNanos::new(5000),
             maker_order_id: OrderId::new(10),
             taker_order_id: OrderId::new(20),
@@ -335,20 +141,19 @@ mod tests {
             quantity: Quantity::new(5),
         };
 
-        let _copied_trade = original_trade;
-        match original_trade {
-            EngineEvent::Trade { price, .. } => {
-                assert_eq!(price.inner(), 100);
-            }
-            _ => unreachable!(),
-        }
+        // When we copy each event
+        // Then the original and the copy compare equal
+        assert_copy(accepted);
+        assert_copy(rejected);
+        assert_copy(replaced);
+        assert_copy(canceled);
+        assert_copy(trade);
     }
 
-    /// Test EngineEventRejectReason variants.
     #[test]
-    fn engine_event_reject_reason_variants() {
-        // Test all rejection reasons
-        let reasons = vec![
+    fn engine_event_reject_reason_variants_are_distinct() {
+        // Given every rejection reason
+        let reasons = [
             EngineEventRejectReason::InvalidQuantity,
             EngineEventRejectReason::UnknownInstrument,
             EngineEventRejectReason::OrderNotFound,
@@ -356,264 +161,111 @@ mod tests {
             EngineEventRejectReason::Other,
         ];
 
+        // When we copy each reason
+        // Then each reason equals its copy and InvalidQuantity is not Other
         for reason in reasons {
-            // Test Copy
-            let original = reason;
-            let copy = original;
-            assert_eq!(original, copy);
-
-            // Test Debug
-            let _debug_str = format!("{:?}", reason);
+            assert_copy(reason);
         }
+        assert_ne!(
+            EngineEventRejectReason::InvalidQuantity,
+            EngineEventRejectReason::Other
+        );
     }
 
-    /// Test EngineEvent equality.
     #[test]
     fn engine_event_equality() {
-        // Test Accepted equality
-        let event1 = EngineEvent::Accepted {
-            sequence: Sequence::new(1),
+        // Given two Accepted events with the same fields
+        let event_one = sample_accepted();
+        let event_two = sample_accepted();
+        let different_sequence = EngineEvent::Accepted {
+            event_sequence: EventSequence::new(2),
+            command_sequence: CommandSequence::new(10),
             timestamp_nanos: TimestampNanos::new(1000),
             order_id: OrderId::new(42),
             client_order_id: ClientOrderId::new(7),
             account_id: AccountId::new(1),
         };
 
-        let event2 = EngineEvent::Accepted {
-            sequence: Sequence::new(1),
-            timestamp_nanos: TimestampNanos::new(1000),
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(7),
-            account_id: AccountId::new(1),
-        };
-
-        assert_eq!(event1, event2);
-
-        // Test inequality
-        let event3 = EngineEvent::Accepted {
-            sequence: Sequence::new(2), // Different
-            timestamp_nanos: TimestampNanos::new(1000),
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(7),
-            account_id: AccountId::new(1),
-        };
-
-        assert_ne!(event1, event3);
-
-        // Test Rejected equality
-        let reject1 = EngineEvent::Rejected {
-            sequence: Sequence::new(1),
-            timestamp_nanos: TimestampNanos::new(1000),
-            client_order_id: ClientOrderId::new(7),
-            reason: EngineEventRejectReason::InvalidQuantity,
-        };
-
-        let reject2 = EngineEvent::Rejected {
-            sequence: Sequence::new(1),
-            timestamp_nanos: TimestampNanos::new(1000),
-            client_order_id: ClientOrderId::new(7),
-            reason: EngineEventRejectReason::InvalidQuantity,
-        };
-
-        assert_eq!(reject1, reject2);
-
-        // Test Trade equality
-        let trade1 = EngineEvent::Trade {
-            sequence: Sequence::new(5),
-            timestamp_nanos: TimestampNanos::new(5000),
-            maker_order_id: OrderId::new(10),
-            taker_order_id: OrderId::new(20),
-            instrument_id: InstrumentId::new(2),
-            price: Price::new(100),
-            quantity: Quantity::new(5),
-        };
-
-        let trade2 = EngineEvent::Trade {
-            sequence: Sequence::new(5),
-            timestamp_nanos: TimestampNanos::new(5000),
-            maker_order_id: OrderId::new(10),
-            taker_order_id: OrderId::new(20),
-            instrument_id: InstrumentId::new(2),
-            price: Price::new(100),
-            quantity: Quantity::new(5),
-        };
-
-        assert_eq!(trade1, trade2);
+        // When we compare them
+        // Then equal events match and a different event sequence does not
+        assert_eq!(event_one, event_two);
+        assert_ne!(event_one, different_sequence);
     }
 
-    /// Test Sequence and TimestampNanos types.
     #[test]
-    fn sequence_and_timestamp_nanos_work() {
-        let sequence = Sequence::new(42);
-        assert_eq!(sequence.inner(), 42);
+    fn accepted_carries_event_sequence_and_command_sequence() {
+        // Given an Accepted event with specific clocks and identities
+        let accepted_event = sample_accepted();
 
-        let timestamp = TimestampNanos::new(1234567890);
-        assert_eq!(timestamp.inner(), 1234567890);
-
-        // Test Copy
-        let copy_sequence = sequence;
-        assert_eq!(sequence.inner(), 42);
-        assert_eq!(copy_sequence.inner(), 42);
-
-        let copy_timestamp = timestamp;
-        assert_eq!(timestamp.inner(), 1234567890);
-        assert_eq!(copy_timestamp.inner(), 1234567890);
-    }
-
-    /// Test that Accepted event echoes both client_order_id and order_id.
-    ///
-    /// When an order is accepted, the event should contain both:
-    /// - client_order_id from the original command
-    /// - order_id assigned by the engine
-    #[test]
-    fn accepted_echoes_client_order_id_and_order_id() {
-        // Given: an Accepted event with specific IDs
-        let sequence = Sequence::new(1);
-        let timestamp = TimestampNanos::new(1000);
-        let order_id = OrderId::new(42);
-        let client_order_id = ClientOrderId::new(7);
-        let account_id = AccountId::new(1);
-
-        // When: creating an Accepted event
-        let accepted_event = EngineEvent::Accepted {
-            sequence,
-            timestamp_nanos: timestamp,
+        // When we read the event
+        // Then both clocks and both order identifiers are present
+        let EngineEvent::Accepted {
+            event_sequence,
+            command_sequence,
+            timestamp_nanos,
             order_id,
             client_order_id,
             account_id,
+        } = accepted_event
+        else {
+            panic!("expected Accepted");
         };
-
-        // Then: both IDs are preserved
-        match accepted_event {
-            EngineEvent::Accepted {
-                sequence: seq,
-                timestamp_nanos: ts,
-                order_id: oid,
-                client_order_id: cid,
-                account_id: aid,
-            } => {
-                assert_eq!(seq.inner(), 1);
-                assert_eq!(ts.inner(), 1000);
-                assert_eq!(oid.inner(), 42);
-                assert_eq!(cid.inner(), 7);
-                assert_eq!(aid.inner(), 1);
-            }
-            _ => panic!("Expected Accepted variant"),
-        }
-
-        // Verify the event is Copy
-        let copied_event = accepted_event;
-        match copied_event {
-            EngineEvent::Accepted {
-                order_id,
-                client_order_id,
-                ..
-            } => {
-                assert_eq!(order_id.inner(), 42);
-                assert_eq!(client_order_id.inner(), 7);
-            }
-            _ => unreachable!(),
-        }
+        assert_eq!(event_sequence.inner(), 1);
+        assert_eq!(command_sequence.inner(), 10);
+        assert_eq!(timestamp_nanos.inner(), 1000);
+        assert_eq!(order_id.inner(), 42);
+        assert_eq!(client_order_id.inner(), 7);
+        assert_eq!(account_id.inner(), 1);
+        assert_copy(accepted_event);
     }
 
-    /// Test that Trade event includes both maker_order_id and taker_order_id.
-    ///
-    /// When a trade occurs, the event must identify:
-    /// - maker_order_id: the resting order that was filled
-    /// - taker_order_id: the new order that executed against the maker
     #[test]
-    fn trade_includes_maker_and_taker_order_ids() {
-        // Given: a Trade event with specific IDs
-        let sequence = Sequence::new(5);
-        let timestamp = TimestampNanos::new(5000);
-        let maker_order_id = OrderId::new(10);
-        let taker_order_id = OrderId::new(20);
-        let instrument_id = InstrumentId::new(2);
-        let price = Price::new(100);
-        let quantity = Quantity::new(5);
+    fn event_sequence_can_differ_from_command_sequence() {
+        // Given an Accepted event whose event and command clocks differ
+        let accepted = sample_accepted();
 
-        // When: creating a Trade event
+        // When we read the clocks
+        let EngineEvent::Accepted {
+            event_sequence,
+            command_sequence,
+            ..
+        } = accepted
+        else {
+            panic!("expected Accepted");
+        };
+
+        // Then the EventSequence is independent of the producing CommandSequence
+        assert_ne!(event_sequence.inner(), command_sequence.inner());
+    }
+
+    #[test]
+    fn trade_includes_maker_order_id_and_taker_order_id() {
+        // Given a Trade event with maker and taker identities
         let trade_event = EngineEvent::Trade {
-            sequence,
-            timestamp_nanos: timestamp,
+            event_sequence: EventSequence::new(5),
+            command_sequence: CommandSequence::new(14),
+            timestamp_nanos: TimestampNanos::new(5000),
+            maker_order_id: OrderId::new(10),
+            taker_order_id: OrderId::new(20),
+            instrument_id: InstrumentId::new(2),
+            price: Price::new(100),
+            quantity: Quantity::new(5),
+        };
+
+        // When we read the event
+        // Then both maker and taker order identifiers are present
+        let EngineEvent::Trade {
             maker_order_id,
             taker_order_id,
             instrument_id,
-            price,
-            quantity,
+            ..
+        } = trade_event
+        else {
+            panic!("expected Trade");
         };
-
-        // Then: both maker and taker order IDs are preserved
-        match trade_event {
-            EngineEvent::Trade {
-                maker_order_id: mid,
-                taker_order_id: tid,
-                ..
-            } => {
-                assert_eq!(mid.inner(), 10);
-                assert_eq!(tid.inner(), 20);
-            }
-            _ => panic!("Expected Trade variant"),
-        }
-
-        // Verify the event is Copy
-        let copied_event = trade_event;
-        match copied_event {
-            EngineEvent::Trade {
-                maker_order_id,
-                taker_order_id,
-                ..
-            } => {
-                assert_eq!(maker_order_id.inner(), 10);
-                assert_eq!(taker_order_id.inner(), 20);
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// Test that Other rejection reason is distinct from InvalidQuantity.
-    ///
-    /// The EngineEventRejectReason enum must have distinct variants
-    /// so that the caller can differentiate between specific failures.
-    #[test]
-    fn reject_reason_other_is_distinct_from_invalid_quantity() {
-        // Given: two different rejection reasons
-        let invalid_quantity = EngineEventRejectReason::InvalidQuantity;
-        let other_reason = EngineEventRejectReason::Other;
-
-        // When: comparing them
-        assert_ne!(invalid_quantity, other_reason);
-
-        // Then: they are distinct variants
-        match invalid_quantity {
-            EngineEventRejectReason::InvalidQuantity => {}
-            _ => panic!("Expected InvalidQuantity"),
-        }
-
-        match other_reason {
-            EngineEventRejectReason::Other => {}
-            _ => panic!("Expected Other"),
-        }
-
-        // Verify Copy
-        let copy_invalid = invalid_quantity;
-        let copy_other = other_reason;
-
-        assert_eq!(invalid_quantity, copy_invalid);
-        assert_eq!(other_reason, copy_other);
-
-        // Verify they serialize to different u8 values
-        let invalid_quantity_u8 = match invalid_quantity {
-            EngineEventRejectReason::InvalidQuantity => 0u8,
-            _ => unreachable!(),
-        };
-        let other_u8 = match other_reason {
-            EngineEventRejectReason::Other => 255u8,
-            _ => unreachable!(),
-        };
-
-        assert_ne!(invalid_quantity_u8, other_u8);
-        assert_eq!(invalid_quantity_u8, 0);
-        assert_eq!(other_u8, 255);
+        assert_eq!(maker_order_id.inner(), 10);
+        assert_eq!(taker_order_id.inner(), 20);
+        assert_eq!(instrument_id.inner(), 2);
+        assert_copy(trade_event);
     }
 }

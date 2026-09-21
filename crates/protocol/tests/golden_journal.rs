@@ -1,99 +1,69 @@
-//! Golden journal fixture and size cap tests for the protocol.
+//! Golden round-trip of mixed OFL1 command and event frames.
 //!
-//! This module provides integration tests that verify:
-//!
-//! - Mixed commands and events round-trip through encode/decode
-//! - Encoded New and Trade frames are at most 128 bytes (excluding header)
-//! - Two New commands with the same AccountId and ClientOrderId but different
-//!   Sequence round-trip correctly (idempotency fixture)
-//!
-//! # Background
-//!
-//! A golden journal is a compact, binary log of commands and events that can be
-//! replayed to reproduce matching results. Each frame consists of:
-//!
-//! - `frame_len` (u16): bytes following this field (kind + payload)
-//! - `kind` (u8): opcode (command or event)
-//! - `payload`: variable-length data
-//!
-//! The journal header precedes all frames and contains:
-//!
-//! - `magic` (4 bytes): "OFL1"
-//! - `schema_version` (u16): 1
-//! - `SessionId` (u64)
-//! - `clock_kind` (u8): 0 logical, 1 wall
-//!
-//! # Usage
-//!
-//! These tests assert that the protocol cannot regress in compactness (AC-7)
-//! and provide fixture bytes for idempotency testing.
+//! When a caller checks stream and datagram envelopes, it uses this module so
+//! both share one payload.
 
 use engine_types::{
-    AccountId, ClientOrderId, EngineCommand, EngineEvent, InstrumentId, OrderId, Side,
-    TimestampNanos,
+    AccountId, ClientOrderId, CommandSequence, EngineCommand, EngineEvent, EventSequence,
+    InstrumentId, JournalSequence, OrderId, SequencedCommand, SessionId, Side, TimestampNanos,
 };
 use protocol::{
-    command_codec::{decode_command, encode_command},
-    event_codec::{decode_event, encode_event},
+    command_codec::{
+        decode_command, decode_command_datagram, encode_command, encode_command_datagram,
+    },
+    datagram::{encode_heartbeat, DATAGRAM_HEADER_SIZE},
+    event_codec::{decode_event, decode_event_datagram, encode_event, encode_event_datagram},
+    journal_cursor::JournalCursor,
     journal_header::{ClockKind, JournalHeader},
+    FrameKind, FRAME_HEADER_SIZE,
 };
 
-/// Test that a mixed sequence of commands and events round-trips correctly.
-///
-/// This test simulates a realistic journal with:
-/// - A header (SessionId, clock kind)
-/// - New command
-/// - Accepted event
-/// - Another New command (for duplicate detection testing)
-/// - Trade event
-/// - Cancel command
-/// - Canceled event
+fn sample_new_limit(command_sequence: u64) -> SequencedCommand {
+    SequencedCommand::new(
+        CommandSequence::new(command_sequence),
+        EngineCommand::NewLimit {
+            account_id: AccountId::new(1),
+            client_order_id: ClientOrderId::new(7),
+            instrument_id: InstrumentId::new(2),
+            side: Side::Buy,
+            price: engine_types::Price::new(100),
+            quantity: engine_types::Quantity::new(10),
+        },
+    )
+}
+
 #[test]
 fn golden_journal_mixed_commands_and_events_round_trip() {
-    // Given: A sequence of mixed commands and events
-    let session_id = 42u64;
-    let clock_kind = ClockKind::Logical;
-
-    // Create journal header
+    // Given a session header and a mixed command/event journal
+    let session_id = SessionId::new(42);
     let mut header_bytes = [0u8; 15];
-    let header = JournalHeader::new(session_id, clock_kind);
-    header.encode(&mut header_bytes);
+    JournalHeader::new(session_id, ClockKind::Logical)
+        .encode(&mut header_bytes)
+        .expect("header");
+    let mut cursor = JournalCursor::new();
 
-    // Build a mixed sequence:
-    // 1. New command (account 1, client 7, instrument 2, buy limit)
-    let new_cmd_1 = EngineCommand::New {
-        account_id: AccountId::new(1),
-        client_order_id: ClientOrderId::new(7),
-        instrument_id: InstrumentId::new(2),
-        side: Side::Buy,
-        order_type: engine_types::OrderType::Limit,
-        price: engine_types::Price::new(100),
-        quantity: engine_types::Quantity::new(10),
-    };
-
-    // 2. Accepted event (sequence 1, order_id assigned by engine)
-    let accepted_evt = EngineEvent::Accepted {
-        sequence: engine_types::Sequence::new(1),
+    let new_limit = sample_new_limit(0);
+    let accepted = EngineEvent::Accepted {
+        event_sequence: EventSequence::new(0),
+        command_sequence: CommandSequence::new(0),
         timestamp_nanos: TimestampNanos::new(1000),
         order_id: OrderId::new(100),
         client_order_id: ClientOrderId::new(7),
         account_id: AccountId::new(1),
     };
-
-    // 3. New command (another order, same account/client but different instrument)
-    let new_cmd_2 = EngineCommand::New {
-        account_id: AccountId::new(1),
-        client_order_id: ClientOrderId::new(7), // same as new_cmd_1 for duplicate test
-        instrument_id: InstrumentId::new(3),    // different instrument
-        side: Side::Sell,
-        order_type: engine_types::OrderType::Market,
-        price: engine_types::Price::new(0),
-        quantity: engine_types::Quantity::new(5),
-    };
-
-    // 4. Trade event (maker=100, taker=101)
-    let trade_evt = EngineEvent::Trade {
-        sequence: engine_types::Sequence::new(2),
+    let new_market = SequencedCommand::new(
+        CommandSequence::new(1),
+        EngineCommand::NewMarket {
+            account_id: AccountId::new(1),
+            client_order_id: ClientOrderId::new(8),
+            instrument_id: InstrumentId::new(3),
+            side: Side::Sell,
+            quantity: engine_types::Quantity::new(5),
+        },
+    );
+    let trade = EngineEvent::Trade {
+        event_sequence: EventSequence::new(1),
+        command_sequence: CommandSequence::new(1),
         timestamp_nanos: TimestampNanos::new(2000),
         maker_order_id: OrderId::new(100),
         taker_order_id: OrderId::new(101),
@@ -101,241 +71,250 @@ fn golden_journal_mixed_commands_and_events_round_trip() {
         price: engine_types::Price::new(100),
         quantity: engine_types::Quantity::new(3),
     };
-
-    // 5. Cancel command
-    let cancel_cmd = EngineCommand::CancelByOrder {
-        order_id: OrderId::new(100),
-    };
-
-    // 6. Canceled event
-    let canceled_evt = EngineEvent::Canceled {
-        sequence: engine_types::Sequence::new(3),
+    let cancel = SequencedCommand::new(
+        CommandSequence::new(2),
+        EngineCommand::CancelByOrder {
+            order_id: OrderId::new(100),
+        },
+    );
+    let canceled = EngineEvent::Canceled {
+        event_sequence: EventSequence::new(2),
+        command_sequence: CommandSequence::new(2),
         timestamp_nanos: TimestampNanos::new(3000),
         order_id: OrderId::new(100),
     };
 
-    // When: We encode all frames into a journal
-    let mut journal_bytes = Vec::new();
+    // When we encode with contiguous JournalSequence values
+    let mut journal = Vec::new();
+    journal.extend_from_slice(&header_bytes);
 
-    // Add header
-    journal_bytes.extend_from_slice(&header_bytes);
-
-    // Encode and add New command 1
     let mut frame_buf = [0u8; 128];
-    let encoded_len_1 = encode_command(&new_cmd_1, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_len_1]);
 
-    // Encode and add Accepted event
-    let encoded_evt_len = encode_event(&accepted_evt, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_evt_len]);
+    let journal_0 = cursor.next_journal_sequence();
+    let len = encode_command(&new_limit, journal_0, &mut frame_buf).expect("new");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // Encode and add New command 2
-    let encoded_len_2 = encode_command(&new_cmd_2, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_len_2]);
+    let journal_1 = cursor.next_journal_sequence();
+    let len = encode_event(&accepted, journal_1, &mut frame_buf).expect("accepted");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // Encode and add Trade event
-    let encoded_trade_len = encode_event(&trade_evt, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_trade_len]);
+    let journal_2 = cursor.next_journal_sequence();
+    let len = encode_command(&new_market, journal_2, &mut frame_buf).expect("market");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // Encode and add Cancel command
-    let encoded_cancel_len = encode_command(&cancel_cmd, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_cancel_len]);
+    let journal_3 = cursor.next_journal_sequence();
+    let len = encode_event(&trade, journal_3, &mut frame_buf).expect("trade");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // Encode and add Canceled event
-    let encoded_canceled_len = encode_event(&canceled_evt, &mut frame_buf);
-    journal_bytes.extend_from_slice(&frame_buf[..encoded_canceled_len]);
+    let journal_4 = cursor.next_journal_sequence();
+    let len = encode_command(&cancel, journal_4, &mut frame_buf).expect("cancel");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // When: We decode the journal
-    let mut offset = 0;
+    let journal_5 = cursor.next_journal_sequence();
+    let len = encode_event(&canceled, journal_5, &mut frame_buf).expect("canceled");
+    journal.extend_from_slice(&frame_buf[..len]);
 
-    // Decode header
-    let decoded_header =
-        JournalHeader::decode(&journal_bytes[offset..offset + 15]).expect("header decode failed");
-    offset += 15;
+    // Then the header and frames round-trip with contiguous JournalSequence 0..5
+    let decoded_header = JournalHeader::decode(&journal[..15]).expect("header decode");
     assert_eq!(decoded_header.session_id(), session_id);
-    assert_eq!(decoded_header.clock_kind(), clock_kind);
 
-    // Decode New command 1
-    let (decoded_cmd_1, consumed_1) =
-        decode_command(&journal_bytes[offset..]).expect("command 1 decode failed");
-    offset += consumed_1;
-    assert_eq!(decoded_cmd_1, new_cmd_1);
+    let mut offset = 15usize;
+    let (decoded_new, js0, consumed) = decode_command(&journal[offset..]).expect("new");
+    assert_eq!(decoded_new, new_limit);
+    assert_eq!(js0.inner(), 0);
+    offset += consumed;
 
-    // Decode Accepted event
-    let (decoded_evt_1, consumed_evt_1) =
-        decode_event(&journal_bytes[offset..]).expect("event 1 decode failed");
-    offset += consumed_evt_1;
-    assert_eq!(decoded_evt_1, accepted_evt);
+    let (decoded_accepted, js1, consumed) = decode_event(&journal[offset..]).expect("accepted");
+    assert_eq!(decoded_accepted, accepted);
+    assert_eq!(js1.inner(), 1);
+    offset += consumed;
 
-    // Decode New command 2
-    let (decoded_cmd_2, consumed_2) =
-        decode_command(&journal_bytes[offset..]).expect("command 2 decode failed");
-    offset += consumed_2;
-    assert_eq!(decoded_cmd_2, new_cmd_2);
+    let (decoded_market, js2, consumed) = decode_command(&journal[offset..]).expect("market");
+    assert_eq!(decoded_market, new_market);
+    assert_eq!(js2.inner(), 2);
+    offset += consumed;
 
-    // Decode Trade event
-    let (decoded_trade, consumed_trade) =
-        decode_event(&journal_bytes[offset..]).expect("trade decode failed");
-    offset += consumed_trade;
-    assert_eq!(decoded_trade, trade_evt);
+    let (decoded_trade, js3, consumed) = decode_event(&journal[offset..]).expect("trade");
+    assert_eq!(decoded_trade, trade);
+    assert_eq!(js3.inner(), 3);
+    offset += consumed;
 
-    // Decode Cancel command
-    let (decoded_cancel, consumed_cancel) =
-        decode_command(&journal_bytes[offset..]).expect("cancel decode failed");
-    offset += consumed_cancel;
-    assert_eq!(decoded_cancel, cancel_cmd);
+    let (decoded_cancel, js4, consumed) = decode_command(&journal[offset..]).expect("cancel");
+    assert_eq!(decoded_cancel, cancel);
+    assert_eq!(js4.inner(), 4);
+    offset += consumed;
 
-    // Decode Canceled event
-    let (decoded_canceled, consumed_canceled) =
-        decode_event(&journal_bytes[offset..]).expect("canceled decode failed");
-    offset += consumed_canceled;
-    assert_eq!(decoded_canceled, canceled_evt);
+    let (decoded_canceled, js5, consumed) = decode_event(&journal[offset..]).expect("canceled");
+    assert_eq!(decoded_canceled, canceled);
+    assert_eq!(js5.inner(), 5);
+    offset += consumed;
 
-    // Then: We consumed exactly the bytes we wrote
-    assert_eq!(offset, journal_bytes.len());
+    assert_eq!(offset, journal.len());
 }
 
-/// Test that New and Trade frames are at most 128 bytes (excluding header).
 #[test]
-fn golden_journal_new_and_trade_frames_are_at_most_128_bytes() {
-    // Given: A New command and a Trade event
-    let new_cmd = EngineCommand::New {
-        account_id: AccountId::new(1),
-        client_order_id: ClientOrderId::new(7),
-        instrument_id: InstrumentId::new(2),
-        side: Side::Buy,
-        order_type: engine_types::OrderType::Limit,
-        price: engine_types::Price::new(100),
-        quantity: engine_types::Quantity::new(10),
-    };
-
-    let trade_evt = EngineEvent::Trade {
-        sequence: engine_types::Sequence::new(1),
-        timestamp_nanos: TimestampNanos::new(1000),
-        maker_order_id: OrderId::new(10),
-        taker_order_id: OrderId::new(20),
+fn new_limit_and_trade_frames_stay_within_size_caps() {
+    // Given a NewLimit command and a Trade event
+    let sequenced = sample_new_limit(0);
+    let trade = EngineEvent::Trade {
+        event_sequence: EventSequence::new(1),
+        command_sequence: CommandSequence::new(0),
+        timestamp_nanos: TimestampNanos::new(2000),
+        maker_order_id: OrderId::new(100),
+        taker_order_id: OrderId::new(101),
         instrument_id: InstrumentId::new(2),
         price: engine_types::Price::new(100),
-        quantity: engine_types::Quantity::new(5),
+        quantity: engine_types::Quantity::new(3),
     };
+    let mut stream_buf = [0u8; 128];
+    let mut datagram_buf = [0u8; 512];
 
-    // When: We encode both
-    let mut frame_buf = [0u8; 128];
+    // When we encode stream and datagram forms
+    let stream_new =
+        encode_command(&sequenced, JournalSequence::new(0), &mut stream_buf).expect("stream new");
+    let stream_trade =
+        encode_event(&trade, JournalSequence::new(1), &mut stream_buf).expect("stream trade");
+    let datagram_new = encode_command_datagram(
+        &sequenced,
+        SessionId::new(1),
+        JournalSequence::new(0),
+        &mut datagram_buf,
+    )
+    .expect("datagram new");
+    let datagram_trade = encode_event_datagram(
+        &trade,
+        SessionId::new(1),
+        JournalSequence::new(1),
+        &mut datagram_buf,
+    )
+    .expect("datagram trade");
 
-    // New command
-    let new_encoded_len = encode_command(&new_cmd, &mut frame_buf);
-
-    // Trade event
-    let trade_encoded_len = encode_event(&trade_evt, &mut frame_buf);
-
-    // Then: Both are at most 128 bytes (excluding header)
-    // Per AC-7: "Encoded New and Trade frames are ≤ 128 bytes each (header excluded)"
-    assert!(
-        new_encoded_len <= 128,
-        "New frame is {} bytes, expected at most 128",
-        new_encoded_len
-    );
-    assert!(
-        trade_encoded_len <= 128,
-        "Trade frame is {} bytes, expected at most 128",
-        trade_encoded_len
-    );
-
-    // Verify the actual sizes (per SPECS):
-    // New: 3 (header) + 50 (payload) = 53 bytes
-    // Trade: 3 (header) + 64 (payload) = 67 bytes
-    assert_eq!(
-        new_encoded_len, 53,
-        "New command should be exactly 53 bytes"
-    );
-    assert_eq!(
-        trade_encoded_len, 67,
-        "Trade event should be exactly 67 bytes"
-    );
+    // Then stream frames fit in 128 and datagrams stay under 512
+    assert!(stream_new <= 128);
+    assert!(stream_trade <= 128);
+    assert!(datagram_new <= 512);
+    assert!(datagram_trade <= 512);
+    assert_eq!(datagram_new, DATAGRAM_HEADER_SIZE + 57);
+    assert_eq!(datagram_trade, DATAGRAM_HEADER_SIZE + 72);
 }
 
-/// Test that two New commands with the same AccountId and ClientOrderId
-/// but different Sequence round-trip correctly.
-///
-/// This is a fixture for duplicate New detection (idempotency). The two
-/// commands have identical payloads except for Sequence/TimestampNanos on
-/// the events. Commands themselves do not include Sequence.
 #[test]
-fn golden_journal_two_new_frames_share_account_and_client_order_id_with_different_sequence() {
-    // Given: Two New commands with same account and client order id
-    let new_cmd = EngineCommand::New {
-        account_id: AccountId::new(1),
-        client_order_id: ClientOrderId::new(7),
-        instrument_id: InstrumentId::new(2),
-        side: Side::Buy,
-        order_type: engine_types::OrderType::Limit,
-        price: engine_types::Price::new(100),
-        quantity: engine_types::Quantity::new(10),
-    };
+fn duplicate_new_limit_with_different_command_sequence_differs_on_wire() {
+    // Given two NewLimit commands that share AccountId and ClientOrderId
+    let first = sample_new_limit(1);
+    let second = sample_new_limit(2);
+    let mut buf1 = [0u8; 128];
+    let mut buf2 = [0u8; 128];
 
-    // When: We encode the same command twice
-    let mut frame_buf1 = [0u8; 128];
-    let encoded_len_1 = encode_command(&new_cmd, &mut frame_buf1);
+    // When we encode both
+    let len1 = encode_command(&first, JournalSequence::new(0), &mut buf1).expect("first");
+    let len2 = encode_command(&second, JournalSequence::new(1), &mut buf2).expect("second");
 
-    let mut frame_buf2 = [0u8; 128];
-    let encoded_len_2 = encode_command(&new_cmd, &mut frame_buf2);
+    // Then encodings differ because CommandSequence differs
+    assert_ne!(&buf1[..len1], &buf2[..len2]);
+    let (decoded1, _, _) = decode_command(&buf1).expect("decode1");
+    let (decoded2, _, _) = decode_command(&buf2).expect("decode2");
+    assert_eq!(decoded1.command(), decoded2.command());
+    assert_ne!(decoded1.command_sequence(), decoded2.command_sequence());
+}
 
-    // Then: The encodings are identical (commands don't include Sequence)
-    assert_eq!(encoded_len_1, encoded_len_2);
-    assert_eq!(&frame_buf1[..encoded_len_1], &frame_buf2[..encoded_len_2]);
+#[test]
+fn stream_and_datagram_share_payload_bytes() {
+    // Given a NewLimit command
+    let sequenced = sample_new_limit(4);
+    let session_id = SessionId::new(42);
+    let journal_sequence = JournalSequence::new(11);
+    let mut stream_buf = [0u8; 128];
+    let mut datagram_buf = [0u8; 128];
 
-    // Decode both to verify they match
-    let (decoded_cmd_1, _consumed_1) =
-        decode_command(&frame_buf1).expect("first command decode failed");
-    let (decoded_cmd_2, _consumed_2) =
-        decode_command(&frame_buf2).expect("second command decode failed");
+    // When we encode both envelopes
+    encode_command(&sequenced, journal_sequence, &mut stream_buf).expect("stream");
+    let datagram_len =
+        encode_command_datagram(&sequenced, session_id, journal_sequence, &mut datagram_buf)
+            .expect("datagram");
+    let (stream_decoded, stream_journal, _) = decode_command(&stream_buf).expect("stream decode");
+    let (datagram_decoded, datagram_session, datagram_journal) =
+        decode_command_datagram(&datagram_buf[..datagram_len]).expect("datagram decode");
 
-    assert_eq!(decoded_cmd_1, new_cmd);
-    assert_eq!(decoded_cmd_2, new_cmd);
+    // Then both envelopes yield the same SequencedCommand
+    assert_eq!(stream_decoded, sequenced);
+    assert_eq!(datagram_decoded, sequenced);
+    assert_eq!(stream_journal, journal_sequence);
+    assert_eq!(datagram_journal, journal_sequence);
+    assert_eq!(datagram_session, session_id);
+}
 
-    // Now test with Accepted events that have different Sequence
-    let accepted_evt_1 = EngineEvent::Accepted {
-        sequence: engine_types::Sequence::new(1), // different Sequence
-        timestamp_nanos: TimestampNanos::new(1000),
-        order_id: OrderId::new(100),
-        client_order_id: ClientOrderId::new(7),
-        account_id: AccountId::new(1),
-    };
+#[test]
+fn heartbeat_datagram_is_kind_zero_with_empty_payload() {
+    // Given a heartbeat for the last JournalSequence
+    let mut buffer = [0u8; DATAGRAM_HEADER_SIZE];
+    let encoded_len =
+        encode_heartbeat(SessionId::new(1), JournalSequence::new(99), &mut buffer).expect("encode");
 
-    let accepted_evt_2 = EngineEvent::Accepted {
-        sequence: engine_types::Sequence::new(2), // different Sequence
-        timestamp_nanos: TimestampNanos::new(1001),
-        order_id: OrderId::new(100), // same order_id (engine-assigned)
-        client_order_id: ClientOrderId::new(7),
-        account_id: AccountId::new(1),
-    };
+    // When we decode through the datagram envelope
+    let (_session, journal, kind, payload) =
+        protocol::datagram::decode(&buffer[..encoded_len]).expect("decode");
 
-    // Encode the two Accepted events
-    let mut event_buf1 = [0u8; 128];
-    let encoded_evt_1 = encode_event(&accepted_evt_1, &mut event_buf1);
+    // Then kind is Heartbeat and payload is empty
+    assert_eq!(kind, FrameKind::Heartbeat);
+    assert_eq!(journal.inner(), 99);
+    assert!(payload.is_empty());
+}
 
-    let mut event_buf2 = [0u8; 128];
-    let encoded_evt_2 = encode_event(&accepted_evt_2, &mut event_buf2);
+#[test]
+fn reserved_opcodes_fail_closed() {
+    // Given reserved iceberg and RFQ kinds on the stream envelope
+    for kind in [0x06u8, 0x40u8, 0xA0u8] {
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[2] = kind;
+        buf[3..11].copy_from_slice(&0u64.to_le_bytes());
 
-    // Decode both events
-    let (decoded_evt_1, _consumed_evt_1) =
-        decode_event(&event_buf1).expect("first event decode failed");
-    let (decoded_evt_2, _consumed_evt_2) =
-        decode_event(&event_buf2).expect("second event decode failed");
+        // When we decode as a command
+        let result = decode_command(&buf);
 
-    // Then: Events round-trip correctly with different Sequence
-    assert_eq!(decoded_evt_1, accepted_evt_1);
-    assert_eq!(decoded_evt_2, accepted_evt_2);
+        // Then decode fails closed
+        assert!(result.is_err(), "kind {kind:#04x} should fail closed");
+    }
+}
 
-    // And the events have different encodings due to Sequence
-    assert_ne!(&event_buf1[..encoded_evt_1], &event_buf2[..encoded_evt_2]);
+#[test]
+fn reserved_event_opcodes_fail_closed_on_stream() {
+    // Given reserved iceberg and RFQ kinds on the stream envelope
+    for kind in [0x06u8, 0x40u8, 0xA0u8] {
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[2] = kind;
+        buf[3..11].copy_from_slice(&0u64.to_le_bytes());
 
-    // And both are within the 128 byte limit
-    assert!(encoded_evt_1 <= 128);
-    assert!(encoded_evt_2 <= 128);
+        // When we decode as an event
+        let result = decode_event(&buf);
 
-    // Verify exact sizes (per SPECS):
-    // Accepted: 3 (header) + 40 (payload) = 43 bytes
-    assert_eq!(encoded_evt_1, 43);
-    assert_eq!(encoded_evt_2, 43);
+        // Then decode fails closed
+        assert!(result.is_err(), "kind {kind:#04x} should fail closed");
+    }
+}
+
+#[test]
+fn reserved_opcodes_fail_closed_on_datagram() {
+    // Given reserved iceberg and RFQ kinds on a datagram
+    for kind in [0x06u8, 0x40u8, 0xA0u8] {
+        let mut buffer = [0u8; DATAGRAM_HEADER_SIZE];
+        buffer[16] = kind;
+
+        // When we decode as a command datagram
+        let command_result = decode_command_datagram(&buffer);
+        // And when we decode as an event datagram
+        let event_result = decode_event_datagram(&buffer);
+
+        // Then both fail closed
+        assert!(
+            command_result.is_err(),
+            "command kind {kind:#04x} should fail closed"
+        );
+        assert!(
+            event_result.is_err(),
+            "event kind {kind:#04x} should fail closed"
+        );
+    }
 }

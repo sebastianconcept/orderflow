@@ -1,3 +1,7 @@
+//! Scheduler process entry.
+//!
+//! When this process starts, it schedules one Order and exits.
+
 use engine_types::{Order, OrderId};
 use scheduler::Scheduler;
 

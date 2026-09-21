@@ -1,159 +1,128 @@
-//! Command encoding and decoding for the protocol.
+//! Packed encode and decode of SequencedCommand.
 //!
-//! This module provides serialization and deserialization of [`EngineCommand`]
-//! values into the compact binary format used in replayable event logs.
-//!
-//! # Wire Format
-//!
-//! Each command is encoded as a frame:
-//!
-//! - `frame_len` (u16, little-endian): Length of kind + payload
-//! - `kind` (u8): Opcode identifying the command type
-//! - `payload` (variable): Command-specific data
-//!
-//! # Opcodes
-//!
-//! | Kind | Name           |
-//! |------|----------------|
-//! | 0x01 | New            |
-//! | 0x02 | CancelByOrder  |
-//! | 0x03 | CancelByClient |
-//! | 0x04 | Replace        |
-//!
-//! # Examples
+//! When a caller writes a command into a stream or datagram buffer, it uses
+//! this module so both envelopes share one payload layout.
 //!
 //! ```
-//! use engine_types::{AccountId, ClientOrderId, EngineCommand, InstrumentId, OrderType, Price, Quantity, Side};
+//! use engine_types::{
+//!     AccountId, ClientOrderId, CommandSequence, EngineCommand, InstrumentId, JournalSequence,
+//!     Price, Quantity, SequencedCommand, SessionId, Side,
+//! };
 //! use protocol::command_codec;
 //!
-//! // Create a New command
-//! let command = EngineCommand::New {
-//!     account_id: AccountId::new(1),
-//!     client_order_id: ClientOrderId::new(7),
-//!     instrument_id: InstrumentId::new(2),
-//!     side: Side::Buy,
-//!     order_type: OrderType::Limit,
-//!     price: Price::new(100),
-//!     quantity: Quantity::new(10),
-//! };
-//!
-//! // Encode to bytes
-//! let mut buf = [0u8; 128];
-//! let encoded_len = command_codec::encode_command(&command, &mut buf);
-//!
-//! // Decode back
-//! let (decoded_cmd, consumed) = command_codec::decode_command(&buf).expect("should decode successfully");
-//! assert_eq!(command, decoded_cmd);
+//! let sequenced = SequencedCommand::new(
+//!     CommandSequence::new(0),
+//!     EngineCommand::NewLimit {
+//!         account_id: AccountId::new(1),
+//!         client_order_id: ClientOrderId::new(7),
+//!         instrument_id: InstrumentId::new(2),
+//!         side: Side::Buy,
+//!         price: Price::new(100),
+//!         quantity: Quantity::new(10),
+//!     },
+//! );
+//! let mut buffer = [0u8; 128];
+//! let encoded_len = command_codec::encode_command(
+//!     &sequenced,
+//!     JournalSequence::new(0),
+//!     &mut buffer,
+//! )
+//! .expect("encode");
+//! let (decoded, journal_sequence, _consumed) =
+//!     command_codec::decode_command(&buffer).expect("decode");
+//! assert_eq!(sequenced, decoded);
+//! assert_eq!(journal_sequence.inner(), 0);
+//! assert!(encoded_len > 0);
 //! ```
-//!
-//! # Error Handling
-//!
-//! Unknown opcodes return [`DecodeError::UnknownKind`]. Malformed data
-//! returns appropriate errors describing the failure.
 
+use displaydoc::Display;
 use engine_types::{
-    AccountId, ClientOrderId, EngineCommand, InstrumentId, OrderId, OrderType, Price, Quantity,
-    Side,
+    AccountId, ClientOrderId, CommandSequence, EngineCommand, InstrumentId, JournalSequence,
+    OrderId, Price, Quantity, SequencedCommand, SessionId, Side,
 };
-
-use crate::frame::{DecodeError as FrameDecodeError, Frame, FrameKind};
 use thiserror::Error;
 
-/// Error types for command decoding.
-#[derive(Error, Debug)]
+use crate::datagram::{
+    self, DecodeError as DatagramDecodeError, EncodeError as DatagramEncodeError,
+};
+use crate::frame::{
+    DecodeError as FrameDecodeError, EncodeError as FrameEncodeError, Frame, FrameKind,
+    FRAME_HEADER_SIZE,
+};
+use crate::packed_le::{read_i64, read_u128, read_u64};
+
+/// Failure of command frame decode.
+/// Frame errors, datagram errors, unknown kinds, and payload mismatches stay
+/// distinct.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The input buffer is too short to contain a valid frame.
-    #[error(transparent)]
-    Frame(#[from] FrameDecodeError),
-
-    /// The command kind is not recognized.
-    #[error("unknown command kind: {0:#04x}")]
+    /// Frame decode failed: {0}
+    Frame(#[source] FrameDecodeError),
+    /// Datagram decode failed: {0}
+    Datagram(#[source] DatagramDecodeError),
+    /// Unknown command kind: {0:#04x}
     UnknownKind(u8),
-
-    /// The payload is too short for the expected command type.
-    #[error("payload too short for command kind {kind:#04x}: expected at least {expected} bytes, got {actual}")]
-    PayloadTooShort {
+    /// Payload length is {actual} bytes, expected {expected} for kind {kind:#04x}
+    PayloadLengthMismatch {
         kind: u8,
         expected: usize,
         actual: usize,
     },
-
-    /// Failed to decode a required field from the payload.
-    #[error("failed to decode {field} from payload")]
+    /// Failed to decode {field} from payload
     FieldDecode { field: &'static str },
 }
 
-/// Encode an EngineCommand to a byte buffer.
-///
-/// # Arguments
-///
-/// * `command` - The command to encode.
-/// * `buf` - Mutable buffer to write the encoded frame.
-///
-/// # Returns
-///
-/// The number of bytes written (frame header + payload).
-pub fn encode_command(command: &EngineCommand, buf: &mut [u8]) -> usize {
-    let kind = match command {
-        EngineCommand::New { .. } => FrameKind::NEW,
-        EngineCommand::CancelByOrder { .. } => FrameKind::CANCEL_BY_ORDER,
-        EngineCommand::CancelByClient { .. } => FrameKind::CANCEL_BY_CLIENT,
-        EngineCommand::Replace { .. } => FrameKind::REPLACE,
-    };
-
-    let payload = encode_command_payload(command);
-    Frame::encode(kind, &payload, buf);
-
-    FRAME_HEADER_SIZE + payload.len()
+/// Failure of command frame encode.
+/// Frame and datagram packing failures stay distinct.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Frame encode failed: {0}
+    Frame(#[source] FrameEncodeError),
+    /// Datagram encode failed: {0}
+    Datagram(#[source] DatagramEncodeError),
 }
 
-/// Encode a command's payload into bytes.
-fn encode_command_payload(command: &EngineCommand) -> Vec<u8> {
+/// Answers the shared packed payload of a SequencedCommand.
+/// Stream and datagram envelopes wrap these bytes.
+pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
     let mut payload = Vec::new();
-    match command {
-        EngineCommand::New {
+    payload.extend_from_slice(&sequenced.command_sequence().inner().to_le_bytes());
+    match sequenced.command() {
+        EngineCommand::NewLimit {
             account_id,
             client_order_id,
             instrument_id,
             side,
-            order_type,
             price,
             quantity,
         } => {
-            // New payload: account_id u64, client_order_id u64, instrument_id u64,
-            // side u8 (0 buy, 1 sell), order_type u8 (0 limit, 1 market),
-            // price i64, quantity u128
-
             payload.extend_from_slice(&account_id.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
             payload.extend_from_slice(&instrument_id.inner().to_le_bytes());
-
-            // side: 0 = Buy, 1 = Sell
-            let side_val = match side {
-                Side::Buy => 0u8,
-                Side::Sell => 1u8,
-            };
-            payload.push(side_val);
-
-            // order_type: 0 = Limit, 1 = Market
-            let order_type_val = match order_type {
-                OrderType::Limit => 0u8,
-                OrderType::Market => 1u8,
-            };
-            payload.push(order_type_val);
-
+            payload.push(encode_side(side));
             payload.extend_from_slice(&price.inner().to_le_bytes());
             payload.extend_from_slice(&quantity.inner().to_le_bytes());
         }
+        EngineCommand::NewMarket {
+            account_id,
+            client_order_id,
+            instrument_id,
+            side,
+            quantity,
+        } => {
+            payload.extend_from_slice(&account_id.inner().to_le_bytes());
+            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
+            payload.extend_from_slice(&instrument_id.inner().to_le_bytes());
+            payload.push(encode_side(side));
+            payload.extend_from_slice(&quantity.inner().to_le_bytes());
+        }
         EngineCommand::CancelByOrder { order_id } => {
-            // CancelByOrder payload: order_id u64
             payload.extend_from_slice(&order_id.inner().to_le_bytes());
         }
         EngineCommand::CancelByClient {
             account_id,
             client_order_id,
         } => {
-            // CancelByClient payload: account_id u64, client_order_id u64
             payload.extend_from_slice(&account_id.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
         }
@@ -163,541 +132,385 @@ fn encode_command_payload(command: &EngineCommand) -> Vec<u8> {
             price,
             quantity,
         } => {
-            // Replace payload: order_id u64, client_order_id u64, price i64, quantity u128
             payload.extend_from_slice(&order_id.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
             payload.extend_from_slice(&price.inner().to_le_bytes());
             payload.extend_from_slice(&quantity.inner().to_le_bytes());
         }
     }
-
     payload
 }
 
-/// Decode an EngineCommand from a byte slice.
-///
-/// # Arguments
-///
-/// * `buf` - The byte slice containing an encoded command frame.
-///
-/// # Returns
-///
-/// * `Ok((EngineCommand, consumed))` - The decoded command and number of bytes consumed.
-/// * `Err(DecodeError)` - If decoding fails (unknown kind, truncated payload, etc.).
-pub fn decode_command(buf: &[u8]) -> Result<(EngineCommand, usize), DecodeError> {
-    // First decode the frame to get kind and payload
-    let result = Frame::decode(buf);
-
-    // Handle the frame decode result - re-raise UnknownKind directly
-    let (kind, payload) = match result {
-        Ok((k, p)) => (k, p),
-        Err(FrameDecodeError::UnknownKind(kind_val)) => {
-            // Re-raise UnknownKind as our own error
-            return Err(DecodeError::UnknownKind(kind_val));
-        }
-        Err(e) => {
-            // Wrap other errors
-            return Err(DecodeError::Frame(e));
-        }
-    };
-
-    // Extract kind value
-    let kind_val = kind.inner();
-
-    // Decode the command based on kind
-    match kind_val {
-        0x01 => decode_new_command(payload).map(|cmd| (cmd, FRAME_HEADER_SIZE + payload.len())),
-        0x02 => decode_cancel_by_order(payload).map(|cmd| (cmd, FRAME_HEADER_SIZE + payload.len())),
-        0x03 => {
-            decode_cancel_by_client(payload).map(|cmd| (cmd, FRAME_HEADER_SIZE + payload.len()))
-        }
-        0x04 => decode_replace_command(payload).map(|cmd| (cmd, FRAME_HEADER_SIZE + payload.len())),
-        _ => Err(DecodeError::UnknownKind(kind_val)),
+/// Answers the wire byte for a Side (0 = Buy, 1 = Sell).
+fn encode_side(side: Side) -> u8 {
+    match side {
+        Side::Buy => 0u8,
+        Side::Sell => 1u8,
     }
 }
 
-/// Decode a New command from its payload.
-fn decode_new_command(payload: &[u8]) -> Result<EngineCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 50; // account_id(8) + client_order_id(8) + instrument_id(8) +
-                                    // side(1) + order_type(1) + price(8) + quantity(16)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x01,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
+/// Answers the Side of a wire byte (0 = Buy, 1 = Sell); unknown bytes are a field decode error.
+fn decode_side(side_byte: u8) -> Result<Side, DecodeError> {
+    match side_byte {
+        0 => Ok(Side::Buy),
+        1 => Ok(Side::Sell),
+        _ => Err(DecodeError::FieldDecode { field: "side" }),
     }
+}
 
-    let account_id = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
+/// Answers the FrameKind of an EngineCommand variant.
+fn frame_kind_for_command(command: &EngineCommand) -> FrameKind {
+    match command {
+        EngineCommand::NewLimit { .. } => FrameKind::NewLimit,
+        EngineCommand::NewMarket { .. } => FrameKind::NewMarket,
+        EngineCommand::CancelByOrder { .. } => FrameKind::CancelByOrder,
+        EngineCommand::CancelByClient { .. } => FrameKind::CancelByClient,
+        EngineCommand::Replace { .. } => FrameKind::Replace,
+    }
+}
 
-    let client_order_id = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
+/// Answers a packed stream frame of a SequencedCommand.
+pub fn encode_command(
+    sequenced: &SequencedCommand,
+    journal_sequence: JournalSequence,
+    buffer: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let kind = frame_kind_for_command(&sequenced.command());
+    let payload = encode_command_payload(sequenced);
+    Frame::encode(kind, journal_sequence, &payload, buffer).map_err(EncodeError::Frame)
+}
 
-    let instrument_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
+/// Answers a SequencedCommand of a shared command payload.
+pub fn decode_command_payload(
+    kind: FrameKind,
+    payload: &[u8],
+) -> Result<SequencedCommand, DecodeError> {
+    match kind {
+        FrameKind::NewLimit => decode_new_limit(payload),
+        FrameKind::NewMarket => decode_new_market(payload),
+        FrameKind::CancelByOrder => decode_cancel_by_order(payload),
+        FrameKind::CancelByClient => decode_cancel_by_client(payload),
+        FrameKind::Replace => decode_replace(payload),
+        other => Err(DecodeError::UnknownKind(other.encode())),
+    }
+}
 
-    let side_val = payload[24];
-    let side = match side_val {
-        0 => Side::Buy,
-        1 => Side::Sell,
-        _ => return Err(DecodeError::FieldDecode { field: "side" }),
-    };
-
-    let order_type_val = payload[25];
-    let order_type = match order_type_val {
-        0 => OrderType::Limit,
-        1 => OrderType::Market,
-        _ => {
-            return Err(DecodeError::FieldDecode {
-                field: "order_type",
-            })
+/// Answers a SequencedCommand of a packed stream frame.
+pub fn decode_command(
+    buffer: &[u8],
+) -> Result<(SequencedCommand, JournalSequence, usize), DecodeError> {
+    let (kind, journal_sequence, payload) = match Frame::decode(buffer) {
+        Ok(decoded) => decoded,
+        Err(FrameDecodeError::UnknownKind(unknown_kind)) => {
+            return Err(DecodeError::UnknownKind(unknown_kind));
+        }
+        Err(frame_error) => {
+            return Err(DecodeError::Frame(frame_error));
         }
     };
 
-    let price = i64::from_le_bytes([
-        payload[26],
-        payload[27],
-        payload[28],
-        payload[29],
-        payload[30],
-        payload[31],
-        payload[32],
-        payload[33],
-    ]);
-
-    let quantity_bytes = [
-        payload[34],
-        payload[35],
-        payload[36],
-        payload[37],
-        payload[38],
-        payload[39],
-        payload[40],
-        payload[41],
-        payload[42],
-        payload[43],
-        payload[44],
-        payload[45],
-        payload[46],
-        payload[47],
-        payload[48],
-        payload[49],
-    ];
-    let quantity = u128::from_le_bytes(quantity_bytes);
-
-    Ok(EngineCommand::New {
-        account_id: AccountId::new(account_id),
-        client_order_id: ClientOrderId::new(client_order_id),
-        instrument_id: InstrumentId::new(instrument_id),
-        side,
-        order_type,
-        price: Price::from_i64(price),
-        quantity: Quantity::from_u128(quantity),
-    })
+    let consumed = FRAME_HEADER_SIZE + payload.len();
+    let sequenced = decode_command_payload(kind, payload)?;
+    Ok((sequenced, journal_sequence, consumed))
 }
 
-/// Decode a CancelByOrder command from its payload.
-fn decode_cancel_by_order(payload: &[u8]) -> Result<EngineCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 8; // order_id u64
+/// Answers a packed datagram of a SequencedCommand.
+pub fn encode_command_datagram(
+    sequenced: &SequencedCommand,
+    session_id: SessionId,
+    journal_sequence: JournalSequence,
+    buffer: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let kind = frame_kind_for_command(&sequenced.command());
+    let payload = encode_command_payload(sequenced);
+    datagram::encode(session_id, journal_sequence, kind, &payload, buffer)
+        .map_err(EncodeError::Datagram)
+}
 
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x02,
+/// Answers a SequencedCommand of a packed datagram.
+pub fn decode_command_datagram(
+    buffer: &[u8],
+) -> Result<(SequencedCommand, SessionId, JournalSequence), DecodeError> {
+    let (session_id, journal_sequence, kind, payload) = match datagram::decode(buffer) {
+        Ok(decoded) => decoded,
+        Err(DatagramDecodeError::UnknownKind(unknown_kind)) => {
+            return Err(DecodeError::UnknownKind(unknown_kind));
+        }
+        Err(datagram_error) => {
+            return Err(DecodeError::Datagram(datagram_error));
+        }
+    };
+    let sequenced = decode_command_payload(kind, payload)?;
+    Ok((sequenced, session_id, journal_sequence))
+}
+
+/// Answers a SequencedCommand of a NewLimit payload, or a length mismatch when
+/// the payload is not exactly 57 bytes.
+fn decode_new_limit(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
+    // command_sequence(8) + account(8) + client(8) + instrument(8) + side(1) + price(8) + quantity(16)
+    const EXPECTED_LEN: usize = 57;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::NewLimit.encode(),
             expected: EXPECTED_LEN,
             actual: payload.len(),
         });
     }
-
-    let order_id = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    Ok(EngineCommand::CancelByOrder {
-        order_id: OrderId::new(order_id),
-    })
+    let command_sequence = CommandSequence::new(read_u64(payload, 0));
+    let side = decode_side(payload[32])?;
+    Ok(SequencedCommand::new(
+        command_sequence,
+        EngineCommand::NewLimit {
+            account_id: AccountId::new(read_u64(payload, 8)),
+            client_order_id: ClientOrderId::new(read_u64(payload, 16)),
+            instrument_id: InstrumentId::new(read_u64(payload, 24)),
+            side,
+            price: Price::from_i64(read_i64(payload, 33)),
+            quantity: Quantity::from_u128(read_u128(payload, 41)),
+        },
+    ))
 }
 
-/// Decode a CancelByClient command from its payload.
-fn decode_cancel_by_client(payload: &[u8]) -> Result<EngineCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 16; // account_id u64 + client_order_id u64
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x03,
+/// Answers a SequencedCommand of a NewMarket payload, or a length mismatch when
+/// the payload is not exactly 49 bytes.
+fn decode_new_market(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
+    // command_sequence(8) + account(8) + client(8) + instrument(8) + side(1) + quantity(16)
+    const EXPECTED_LEN: usize = 49;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::NewMarket.encode(),
             expected: EXPECTED_LEN,
             actual: payload.len(),
         });
     }
-
-    let account_id = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let client_order_id = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    Ok(EngineCommand::CancelByClient {
-        account_id: AccountId::new(account_id),
-        client_order_id: ClientOrderId::new(client_order_id),
-    })
+    let command_sequence = CommandSequence::new(read_u64(payload, 0));
+    let side = decode_side(payload[32])?;
+    Ok(SequencedCommand::new(
+        command_sequence,
+        EngineCommand::NewMarket {
+            account_id: AccountId::new(read_u64(payload, 8)),
+            client_order_id: ClientOrderId::new(read_u64(payload, 16)),
+            instrument_id: InstrumentId::new(read_u64(payload, 24)),
+            side,
+            quantity: Quantity::from_u128(read_u128(payload, 33)),
+        },
+    ))
 }
 
-/// Decode a Replace command from its payload.
-fn decode_replace_command(payload: &[u8]) -> Result<EngineCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 40; // order_id(8) + client_order_id(8) + price(8) + quantity(16)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x04,
+/// Answers a SequencedCommand of a CancelByOrder payload, or a length mismatch
+/// when the payload is not exactly 16 bytes.
+fn decode_cancel_by_order(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
+    const EXPECTED_LEN: usize = 16;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::CancelByOrder.encode(),
             expected: EXPECTED_LEN,
             actual: payload.len(),
         });
     }
-
-    let order_id = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let client_order_id = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let price = i64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    let quantity_bytes = [
-        payload[24],
-        payload[25],
-        payload[26],
-        payload[27],
-        payload[28],
-        payload[29],
-        payload[30],
-        payload[31],
-        payload[32],
-        payload[33],
-        payload[34],
-        payload[35],
-        payload[36],
-        payload[37],
-        payload[38],
-        payload[39],
-    ];
-    let quantity = u128::from_le_bytes(quantity_bytes);
-
-    Ok(EngineCommand::Replace {
-        order_id: OrderId::new(order_id),
-        client_order_id: ClientOrderId::new(client_order_id),
-        price: Price::from_i64(price),
-        quantity: Quantity::from_u128(quantity),
-    })
+    Ok(SequencedCommand::new(
+        CommandSequence::new(read_u64(payload, 0)),
+        EngineCommand::CancelByOrder {
+            order_id: OrderId::new(read_u64(payload, 8)),
+        },
+    ))
 }
 
-/// Size of the frame header (frame_len + kind).
-pub const FRAME_HEADER_SIZE: usize = 3;
+/// Answers a SequencedCommand of a CancelByClient payload, or a length mismatch
+/// when the payload is not exactly 24 bytes.
+fn decode_cancel_by_client(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
+    const EXPECTED_LEN: usize = 24;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::CancelByClient.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(SequencedCommand::new(
+        CommandSequence::new(read_u64(payload, 0)),
+        EngineCommand::CancelByClient {
+            account_id: AccountId::new(read_u64(payload, 8)),
+            client_order_id: ClientOrderId::new(read_u64(payload, 16)),
+        },
+    ))
+}
+
+/// Answers a SequencedCommand of a Replace payload, or a length mismatch when
+/// the payload is not exactly 48 bytes.
+fn decode_replace(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
+    const EXPECTED_LEN: usize = 48;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Replace.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(SequencedCommand::new(
+        CommandSequence::new(read_u64(payload, 0)),
+        EngineCommand::Replace {
+            order_id: OrderId::new(read_u64(payload, 8)),
+            client_order_id: ClientOrderId::new(read_u64(payload, 16)),
+            price: Price::from_i64(read_i64(payload, 24)),
+            quantity: Quantity::from_u128(read_u128(payload, 32)),
+        },
+    ))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Test that New limit order round-trips through encode/decode.
+    fn sample_new_limit(command_sequence: u64) -> SequencedCommand {
+        SequencedCommand::new(
+            CommandSequence::new(command_sequence),
+            EngineCommand::NewLimit {
+                account_id: AccountId::new(1),
+                client_order_id: ClientOrderId::new(7),
+                instrument_id: InstrumentId::new(2),
+                side: Side::Buy,
+                price: Price::new(100),
+                quantity: Quantity::new(10),
+            },
+        )
+    }
+
     #[test]
     fn command_codec_new_limit_round_trips() {
-        // Given: a New limit buy order
-        let command = EngineCommand::New {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(7),
-            instrument_id: InstrumentId::new(2),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: Price::new(100),
-            quantity: Quantity::new(10),
-        };
+        // Given a sequenced NewLimit command
+        let sequenced = sample_new_limit(3);
+        let mut buffer = [0u8; 128];
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_command(&command, &mut buf);
+        // When we encode and decode on the stream envelope
+        let encoded_len =
+            encode_command(&sequenced, JournalSequence::new(9), &mut buffer).expect("encode");
+        let (decoded, journal_sequence, consumed) = decode_command(&buffer).expect("decode");
 
-        let (decoded_cmd, consumed) = decode_command(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves command
-        assert_eq!(command, decoded_cmd);
+        // Then round trip preserves the command and JournalSequence
+        assert_eq!(decoded, sequenced);
+        assert_eq!(journal_sequence.inner(), 9);
         assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit (128 bytes max per SPECS)
         assert!(encoded_len <= 128);
     }
 
-    /// Test that CancelByClient round-trips through encode/decode.
     #[test]
-    fn command_codec_cancel_by_client_round_trips() {
-        // Given: a CancelByClient command
-        let command = EngineCommand::CancelByClient {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(7),
-        };
+    fn command_codec_new_market_has_no_price_bytes() {
+        // Given a sequenced NewMarket command
+        let sequenced = SequencedCommand::new(
+            CommandSequence::new(1),
+            EngineCommand::NewMarket {
+                account_id: AccountId::new(1),
+                client_order_id: ClientOrderId::new(8),
+                instrument_id: InstrumentId::new(2),
+                side: Side::Sell,
+                quantity: Quantity::new(5),
+            },
+        );
+        let payload = encode_command_payload(&sequenced);
+        let new_limit_payload = encode_command_payload(&sample_new_limit(1));
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_command(&command, &mut buf);
-
-        let (decoded_cmd, consumed) = decode_command(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves command
-        assert_eq!(command, decoded_cmd);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit (128 bytes max per SPECS)
-        assert!(encoded_len <= 128);
+        // When we compare payload sizes
+        // Then NewMarket is shorter than NewLimit (no price)
+        assert_eq!(payload.len(), 49);
+        assert_eq!(new_limit_payload.len(), 57);
+        assert!(payload.len() < new_limit_payload.len());
     }
 
-    /// Test that CancelByOrder round-trips through encode/decode.
     #[test]
-    fn command_codec_cancel_by_order_round_trips() {
-        // Given: a CancelByOrder command
-        let command = EngineCommand::CancelByOrder {
-            order_id: OrderId::new(42),
-        };
+    fn duplicate_client_order_id_gets_different_payload_bytes() {
+        // Given two NewLimit commands that share AccountId and ClientOrderId
+        let first = sample_new_limit(0);
+        let second = sample_new_limit(1);
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_command(&command, &mut buf);
+        // When we encode both payloads
+        let first_payload = encode_command_payload(&first);
+        let second_payload = encode_command_payload(&second);
 
-        let (decoded_cmd, consumed) = decode_command(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves command
-        assert_eq!(command, decoded_cmd);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit
-        assert!(encoded_len <= 128);
+        // Then the payloads differ because CommandSequence differs
+        assert_ne!(first_payload, second_payload);
     }
 
-    /// Test that Replace round-trips through encode/decode.
     #[test]
-    fn command_codec_replace_round_trips() {
-        // Given: a Replace command
-        let command = EngineCommand::Replace {
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(99),
-            price: Price::new(105),
-            quantity: Quantity::new(12),
-        };
+    fn stream_and_datagram_round_trip_same_payload() {
+        // Given a sequenced NewLimit command
+        let sequenced = sample_new_limit(4);
+        let session_id = SessionId::new(42);
+        let journal_sequence = JournalSequence::new(11);
+        let mut stream_buf = [0u8; 128];
+        let mut datagram_buf = [0u8; 128];
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_command(&command, &mut buf);
+        // When we encode both envelopes and decode
+        encode_command(&sequenced, journal_sequence, &mut stream_buf).expect("stream encode");
+        let datagram_len =
+            encode_command_datagram(&sequenced, session_id, journal_sequence, &mut datagram_buf)
+                .expect("datagram encode");
+        let (stream_decoded, stream_journal, _) = decode_command(&stream_buf).expect("stream");
+        let (datagram_decoded, datagram_session, datagram_journal) =
+            decode_command_datagram(&datagram_buf[..datagram_len]).expect("datagram");
 
-        let (decoded_cmd, consumed) = decode_command(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves command
-        assert_eq!(command, decoded_cmd);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit
-        assert!(encoded_len <= 128);
+        // Then both envelopes yield the same SequencedCommand and JournalSequence
+        assert_eq!(stream_decoded, sequenced);
+        assert_eq!(datagram_decoded, sequenced);
+        assert_eq!(stream_journal, journal_sequence);
+        assert_eq!(datagram_journal, journal_sequence);
+        assert_eq!(datagram_session, session_id);
+        assert_eq!(
+            encode_command_payload(&stream_decoded),
+            encode_command_payload(&datagram_decoded)
+        );
     }
 
-    /// Test that unknown kind returns decode error.
     #[test]
-    fn command_codec_unknown_kind_returns_decode_error() {
-        // Given: a buffer with unknown kind (0xFF)
-        let mut buf = [0u8; 10];
-        // frame_len = 2 (kind + 1 byte payload)
-        buf[0..2].copy_from_slice(&2u16.to_le_bytes());
-        // Unknown kind
+    fn decode_rejects_unknown_command_kind() {
+        // Given a stream frame with unknown kind
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
         buf[2] = 0xFF;
-        // Payload byte
-        buf[3] = 0x00;
+        buf[3..11].copy_from_slice(&0u64.to_le_bytes());
 
-        // When: we try to decode
+        // When we decode
         let result = decode_command(&buf);
 
-        // Then: it returns an error about unknown kind
+        // Then it fails closed
         assert!(matches!(result, Err(DecodeError::UnknownKind(0xFF))));
     }
 
-    /// Test that truncated payload returns error.
     #[test]
-    fn command_codec_truncated_payload_returns_error() {
-        // Given: a buffer with New frame but truncated payload
-        let mut buf = [0u8; 20]; // claims more than it has
-                                 // frame_len = 35 (claiming 35 bytes after header)
-        buf[0..2].copy_from_slice(&35u16.to_le_bytes());
-        // Valid kind (New = 0x01)
-        buf[2] = FrameKind::NEW.encode();
+    fn decode_rejects_invalid_side() {
+        // Given a NewLimit payload whose side byte is not Buy or Sell
+        let sequenced = sample_new_limit(0);
+        let mut payload = encode_command_payload(&sequenced);
+        payload[32] = 0x02;
 
-        // When: we try to decode
-        let result = decode_command(&buf);
+        // When we decode the payload
+        let result = decode_command_payload(FrameKind::NewLimit, &payload);
 
-        // Then: it returns an error about payload too short (wrapped in Frame)
+        // Then decode names the side field
         assert!(matches!(
             result,
-            Err(DecodeError::Frame(FrameDecodeError::PayloadTooShort { .. }))
+            Err(DecodeError::FieldDecode { field: "side" })
         ));
     }
 
-    /// Test that side and order_type decode validate values.
     #[test]
-    fn command_codec_side_and_order_type_decode_validates_values() {
-        // Given: a New payload with invalid side value (2)
-        let mut buf = [0u8; 54];
-        // frame_len = 51 (kind + payload)
-        buf[0..2].copy_from_slice(&51u16.to_le_bytes());
-        // Valid kind (New = 0x01)
-        buf[2] = FrameKind::NEW.encode();
+    fn decode_rejects_new_limit_payload_length_mismatch() {
+        // Given a NewLimit payload that is one byte short
+        let sequenced = sample_new_limit(0);
+        let payload = encode_command_payload(&sequenced);
+        let short_payload = &payload[..payload.len() - 1];
 
-        // Write valid values for first 25 bytes
-        buf[3..11].copy_from_slice(&1u64.to_le_bytes()); // account_id
-        buf[11..19].copy_from_slice(&7u64.to_le_bytes()); // client_order_id
-        buf[19..27].copy_from_slice(&2u64.to_le_bytes()); // instrument_id
+        // When we decode the payload
+        let result = decode_command_payload(FrameKind::NewLimit, short_payload);
 
-        // Invalid side value (2)
-        buf[27] = 2;
-
-        // Valid order_type (0)
-        buf[28] = 0;
-
-        // Valid price and quantity
-        buf[29..37].copy_from_slice(&100i64.to_le_bytes());
-        buf[37..53].copy_from_slice(&10u128.to_le_bytes());
-
-        // When: we try to decode
-        let result = decode_command(&buf);
-
-        // Then: it returns an error about side value
-        assert!(matches!(
+        // Then decode names the expected NewLimit length
+        assert_eq!(
             result,
-            Err(DecodeError::FieldDecode { field: "side", .. })
-        ));
-    }
-
-    /// Test that encode produces expected byte sizes for each command type.
-    #[test]
-    fn command_codec_expected_sizes() {
-        // New: 3 (header) + 50 (payload) = 53 bytes
-        let new_cmd = EngineCommand::New {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(7),
-            instrument_id: InstrumentId::new(2),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: Price::new(100),
-            quantity: Quantity::new(10),
-        };
-        let mut buf = [0u8; 128];
-        assert_eq!(encode_command(&new_cmd, &mut buf), 53);
-
-        // CancelByOrder: 3 (header) + 8 (payload) = 11 bytes
-        let cancel_order_cmd = EngineCommand::CancelByOrder {
-            order_id: OrderId::new(42),
-        };
-        assert_eq!(encode_command(&cancel_order_cmd, &mut buf), 11);
-
-        // CancelByClient: 3 (header) + 16 (payload) = 19 bytes
-        let cancel_client_cmd = EngineCommand::CancelByClient {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(7),
-        };
-        assert_eq!(encode_command(&cancel_client_cmd, &mut buf), 19);
-
-        // Replace: 3 (header) + 40 (payload) = 43 bytes
-        let replace_cmd = EngineCommand::Replace {
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(99),
-            price: Price::new(105),
-            quantity: Quantity::new(12),
-        };
-        assert_eq!(encode_command(&replace_cmd, &mut buf), 43);
-    }
-
-    /// Test that duplicate New with different sequence round-trips correctly.
-    #[test]
-    fn command_codec_duplicate_new_different_sequence() {
-        // Given: two New commands (different client_order_ids would be different requests)
-        let cmd1 = EngineCommand::New {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(7),
-            instrument_id: InstrumentId::new(2),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: Price::new(100),
-            quantity: Quantity::new(10),
-        };
-
-        // When: we encode both
-        let mut buf1 = [0u8; 128];
-        let len1 = encode_command(&cmd1, &mut buf1);
-
-        // Then: round trip preserves both
-        let (decoded1, _) = decode_command(&buf1).expect("decode should succeed");
-        assert_eq!(cmd1, decoded1);
-
-        // Encode another command with different values
-        let cmd2 = EngineCommand::New {
-            account_id: AccountId::new(1),
-            client_order_id: ClientOrderId::new(8), // different
-            instrument_id: InstrumentId::new(2),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: Price::new(101),
-            quantity: Quantity::new(11),
-        };
-
-        let mut buf2 = [0u8; 128];
-        let len2 = encode_command(&cmd2, &mut buf2);
-
-        // Then: different commands have different encodings
-        assert_ne!(buf1[..len1], buf2[..len2]);
-
-        // And round-trip still works
-        let (decoded2, _) = decode_command(&buf2).expect("decode should succeed");
-        assert_eq!(cmd2, decoded2);
+            Err(DecodeError::PayloadLengthMismatch {
+                kind: FrameKind::NewLimit.encode(),
+                expected: 57,
+                actual: 56,
+            })
+        );
     }
 }

@@ -1,34 +1,28 @@
-// Input gateway – placeholder
+//! Intake of orders into the pipeline.
+//!
+//! When a caller polls for an incoming Order, it uses this module. receive
+//! answers none.
 
 use engine_types::Order;
 
-/// Input gateway for receiving orders into the matching engine.
-///
-/// This component is responsible for ingesting incoming order commands
-/// and preparing them for processing by the matching engine.
+/// InputGateway is the intake of orders into the pipeline.
+/// When a caller polls for an incoming Order, it uses this type. receive
+/// answers none.
 pub struct InputGateway;
 
 impl InputGateway {
-    /// Create a new InputGateway instance.
+    /// Answers an InputGateway.
     pub fn new() -> Self {
         Self
     }
 
-    /// Attempt to receive an order from the input source.
-    ///
-    /// This is a placeholder implementation that always returns None.
-    /// Actual order reception logic will be implemented in future stories.
-    ///
-    /// # Returns
-    ///
-    /// Always returns None as a placeholder for future implementation.
+    /// Answers the next order from the input source, or none when no order is waiting.
     pub fn receive(&self) -> Option<Order> {
         None
     }
 }
 
 impl Default for InputGateway {
-    /// Create a default (new) InputGateway instance.
     fn default() -> Self {
         Self::new()
     }
@@ -37,51 +31,51 @@ impl Default for InputGateway {
 #[cfg(test)]
 mod tests {
     use crate::InputGateway;
-    use engine_types::{Order, OrderType, Price, Quantity, Side};
+    use engine_types::{
+        AccountId, ClientOrderId, InstrumentId, Order, OrderId, OrderType, Price, Quantity, Side,
+    };
 
     #[test]
     fn gateway_new_constructs() {
-        // Given: no existing state
-        // When: we create a new InputGateway
+        // Given no existing gateway
+        // When we create an InputGateway
         let gateway = InputGateway::new();
 
-        // Then: the gateway is created successfully
+        // Then the gateway is constructed
         assert!(matches!(gateway, InputGateway));
     }
 
     #[test]
-    fn receive_returns_none_placeholder() {
-        // Given: a new InputGateway
+    fn receive_returns_none_in_this_slice() {
+        // Given a new InputGateway
         let gateway = InputGateway::new();
 
-        // When: we call receive()
+        // When we call receive
         let result = gateway.receive();
 
-        // Then: it returns None (placeholder behavior)
+        // Then no order is returned
         assert!(result.is_none());
     }
 
     #[test]
-    fn lib_compiles_with_engine_types_order() {
-        // Given: an Order constructed from engine-types
+    fn gateway_accepts_engine_types_order() {
+        // Given an Order with integer fields
         let order = Order::new(
-            1,
-            7,
-            2,
-            10,
+            OrderId::new(1),
+            ClientOrderId::new(7),
+            InstrumentId::new(2),
+            AccountId::new(10),
             Side::Buy,
             OrderType::Limit,
             Price::new(100),
             Quantity::new(10),
         );
-
-        // When: we use the order in a gateway context
         let gateway = InputGateway::new();
 
-        // Then: it compiles and we can attempt to receive
+        // When we poll the gateway
         let _ = gateway.receive();
 
-        // Verify the order has correct integer fields (no f64)
+        // Then the order still holds integer price and quantity
         assert_eq!(order.price.inner(), 100);
         assert_eq!(order.quantity.inner(), 10);
         assert!(order.is_limit());

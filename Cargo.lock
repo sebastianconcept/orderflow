@@ -35,8 +35,8 @@ dependencies = [
 name = "engine-core"
 version = "0.1.0"
 dependencies = [
- "engine-gloomio",
  "engine-tokio",
+ "engine-types",
 ]
 
 [[package]]

@@ -1,109 +1,45 @@
-//! Order and order-related types for the matching engine.
+//! Resting or incoming order with integer economic fields.
 //!
-//! This module provides domain types for representing orders in the matching
-//! engine, including side (buy/sell), order type (limit/market), and the
-//! complete Order struct with all necessary fields.
+//! When a pipeline stage carries work, it uses this module so side, order type,
+//! price, and quantity travel as one Order.
 
 use crate::identity::{AccountId, ClientOrderId, InstrumentId, OrderId};
 use crate::price::Price;
 use crate::quantity::Quantity;
 
-/// Order representation with integer fields for economic precision.
-///
-/// An `Order` represents a trading request in the matching engine. It contains
-/// all necessary information to identify, route, and process the order.
-///
-/// # Fields
-///
-/// * `id` - Engine-assigned unique identifier for the order (populated after acceptance)
-/// * `client_order_id` - Client-assigned unique identifier for the request
-/// * `instrument_id` - Identifier for the tradable instrument
-/// * `account_id` - Identifier for the trading account
-/// * `side` - Whether this is a buy or sell order
-/// * `order_type` - Whether this is a limit or market order
-/// * `price` - Price in ticks (for limit orders; unused for market orders)
-/// * `quantity` - Quantity in lots
-///
-/// # Examples
-///
-/// ```
-/// use engine_types::{
-///     AccountId, ClientOrderId, InstrumentId, Order, OrderType, Price, Quantity, Side,
-/// };
-///
-/// // Create a limit buy order
-/// let limit_order = Order::new(
-///     1,
-///     7,
-///     2,
-///     10,
-///     Side::Buy,
-///     OrderType::Limit,
-///     Price::new(100),
-///     Quantity::new(10),
-/// );
-///
-/// // Create a market sell order
-/// let market_order = Order::new(
-///     2,
-///     8,
-///     3,
-///     20,
-///     Side::Sell,
-///     OrderType::Market,
-///     Price::new(0), // unused for market orders
-///     Quantity::new(5),
-/// );
-/// ```
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Order is a trading request with integer price ticks and quantity lots.
+/// When a pipeline stage carries work between stages, it uses this type so the
+/// request is one Order.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Order {
-    /// Engine-assigned unique identifier for the order.
     pub id: OrderId,
-    /// Client-assigned unique identifier for the request.
     pub client_order_id: ClientOrderId,
-    /// Identifier for the tradable instrument.
     pub instrument_id: InstrumentId,
-    /// Identifier for the trading account.
     pub account_id: AccountId,
-    /// Whether this is a buy or sell order.
     pub side: Side,
-    /// Whether this is a limit or market order.
     pub order_type: OrderType,
-    /// Price in ticks (for limit orders; unused for market orders).
     pub price: Price,
-    /// Quantity in lots.
     pub quantity: Quantity,
 }
 
 impl Order {
-    /// Create a new Order with the given fields.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Engine-assigned order ID (use 0 for new orders)
-    /// * `client_order_id` - Client-request identifier
-    /// * `instrument_id` - Instrument being traded
-    /// * `account_id` - Account placing the order
-    /// * `side` - Buy or Sell
-    /// * `order_type` - Limit or Market
-    /// * `price` - Price in ticks (0 for market orders)
-    /// * `quantity` - Quantity in lots
+    /// Answers an Order from its fields.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: u64,
-        client_order_id: u64,
-        instrument_id: u64,
-        account_id: u64,
+        id: OrderId,
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
         side: Side,
         order_type: OrderType,
         price: Price,
         quantity: Quantity,
     ) -> Self {
         Order {
-            id: OrderId::new(id),
-            client_order_id: ClientOrderId::new(client_order_id),
-            instrument_id: InstrumentId::new(instrument_id),
-            account_id: AccountId::new(account_id),
+            id,
+            client_order_id,
+            instrument_id,
+            account_id,
             side,
             order_type,
             price,
@@ -111,61 +47,30 @@ impl Order {
         }
     }
 
-    /// Check if this is a limit order.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use engine_types::{Order, OrderType, Side, Price, Quantity};
-    ///
-    /// let order = Order::new(1, 7, 2, 10, Side::Buy, OrderType::Limit, Price::new(100), Quantity::new(10));
-    /// assert!(order.is_limit());
-    ///
-    /// let market_order = Order::new(2, 8, 3, 20, Side::Sell, OrderType::Market, Price::new(0), Quantity::new(5));
-    /// assert!(!market_order.is_limit());
-    /// ```
+    /// Answers whether this order is a limit order (price is live).
     pub fn is_limit(&self) -> bool {
         matches!(self.order_type, OrderType::Limit)
     }
 
-    /// Check if this is a market order.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use engine_types::{Order, OrderType, Side, Price, Quantity};
-    ///
-    /// let market_order = Order::new(2, 8, 3, 20, Side::Sell, OrderType::Market, Price::new(0), Quantity::new(5));
-    /// assert!(market_order.is_market());
-    ///
-    /// let limit_order = Order::new(1, 7, 2, 10, Side::Buy, OrderType::Limit, Price::new(100), Quantity::new(10));
-    /// assert!(!limit_order.is_market());
-    /// ```
+    /// Answers whether this order is a market order (price is unused).
     pub fn is_market(&self) -> bool {
         matches!(self.order_type, OrderType::Market)
     }
 }
 
-/// Side of an order (buy or sell).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Side is whether an order buys or sells.
+/// When a command names the book side it targets, it uses this type so Buy is
+/// the bid and Sell is the offer.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Side {
-    /// Buy side of the market.
+    /// Bid side of the book.
     Buy,
-    /// Sell side of the market.
+    /// Offer side of the book.
     Sell,
 }
 
 impl Side {
-    /// Convert the side to a string representation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use engine_types::Side;
-    ///
-    /// assert_eq!(Side::Buy.as_str(), "BUY");
-    /// assert_eq!(Side::Sell.as_str(), "SELL");
-    /// ```
+    /// Answers the display label of this Side (`BUY` or `SELL`).
     pub fn as_str(&self) -> &'static str {
         match self {
             Side::Buy => "BUY",
@@ -174,26 +79,19 @@ impl Side {
     }
 }
 
-/// Type of order (limit or market).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// OrderType is whether an order is limit or market.
+/// When a command says whether price is live, it uses this type so Limit rests
+/// at a price and Market takes the best available price.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum OrderType {
-    /// Limit order with a specific price.
+    /// Order that rests at a price.
     Limit,
-    /// Market order executed at best available price.
+    /// Order that takes the best available price.
     Market,
 }
 
 impl OrderType {
-    /// Convert the order type to a string representation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use engine_types::OrderType;
-    ///
-    /// assert_eq!(OrderType::Limit.as_str(), "LIMIT");
-    /// assert_eq!(OrderType::Market.as_str(), "MARKET");
-    /// ```
+    /// Answers the display label of this OrderType (`LIMIT` or `MARKET`).
     pub fn as_str(&self) -> &'static str {
         match self {
             OrderType::Limit => "LIMIT",
@@ -201,16 +99,7 @@ impl OrderType {
         }
     }
 
-    /// Check if this order type has a price field.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use engine_types::OrderType;
-    ///
-    /// assert!(OrderType::Limit.has_price());
-    /// assert!(!OrderType::Market.has_price());
-    /// ```
+    /// Answers whether this order type uses a live price (Limit yes, Market no).
     pub fn has_price(&self) -> bool {
         matches!(self, OrderType::Limit)
     }
@@ -222,7 +111,7 @@ mod tests {
 
     #[test]
     fn limit_order_holds_instrument_side_price_quantity() {
-        // Given: a limit buy order for 10 lots at 100 ticks on instrument 2, account 10
+        // Given a limit buy order for 10 lots at 100 ticks
         let expected_id = 1u64;
         let expected_client_order_id = 7u64;
         let expected_instrument_id = 2u64;
@@ -232,19 +121,19 @@ mod tests {
         let expected_price = Price::new(100);
         let expected_quantity = Quantity::new(10);
 
-        // When: we create the order
+        // When we create the order
         let order = Order::new(
-            expected_id,
-            expected_client_order_id,
-            expected_instrument_id,
-            expected_account_id,
+            OrderId::new(expected_id),
+            ClientOrderId::new(expected_client_order_id),
+            InstrumentId::new(expected_instrument_id),
+            AccountId::new(expected_account_id),
             expected_side,
             expected_order_type,
             expected_price,
             expected_quantity,
         );
 
-        // Then: all fields are set correctly
+        // Then all fields match and the order is a limit order
         assert_eq!(order.id.inner(), expected_id);
         assert_eq!(order.client_order_id.inner(), expected_client_order_id);
         assert_eq!(order.instrument_id.inner(), expected_instrument_id);
@@ -253,150 +142,87 @@ mod tests {
         assert_eq!(order.order_type, expected_order_type);
         assert_eq!(order.price, expected_price);
         assert_eq!(order.quantity, expected_quantity);
-
-        // Verify it's a limit order
         assert!(order.is_limit());
         assert!(!order.is_market());
     }
 
     #[test]
     fn market_order_type_uses_price_zero_as_unused() {
-        // Given: a market sell order
-        let expected_id = 2u64;
-        let expected_client_order_id = 8u64;
-        let expected_instrument_id = 3u64;
-        let expected_account_id = 20u64;
-        let expected_side = Side::Sell;
-        let expected_order_type = OrderType::Market;
-        let expected_price = Price::new(0); // unused for market orders
-        let expected_quantity = Quantity::new(5);
-
-        // When: we create the market order
+        // Given a market sell order with unused price zero
         let order = Order::new(
-            expected_id,
-            expected_client_order_id,
-            expected_instrument_id,
-            expected_account_id,
-            expected_side,
-            expected_order_type,
-            expected_price,
-            expected_quantity,
+            OrderId::new(2),
+            ClientOrderId::new(8),
+            InstrumentId::new(3),
+            AccountId::new(20),
+            Side::Sell,
+            OrderType::Market,
+            Price::new(0),
+            Quantity::new(5),
         );
 
-        // Then: all fields are set correctly
-        assert_eq!(order.id.inner(), expected_id);
-        assert_eq!(order.client_order_id.inner(), expected_client_order_id);
-        assert_eq!(order.instrument_id.inner(), expected_instrument_id);
-        assert_eq!(order.account_id.inner(), expected_account_id);
-        assert_eq!(order.side, expected_side);
-        assert_eq!(order.order_type, expected_order_type);
-        assert_eq!(order.price, expected_price);
-        assert_eq!(order.quantity, expected_quantity);
-
-        // Verify it's a market order
+        // When we inspect the order
+        // Then it is a market order and price is zero
         assert!(!order.is_limit());
         assert!(order.is_market());
-
-        // Verify market orders use Price(0)
         assert_eq!(order.price.inner(), 0);
+        assert_eq!(order.quantity.inner(), 5);
     }
 
     #[test]
     fn order_is_copy() {
-        // Given: an Order instance
+        // Given an Order
         let original_order = Order::new(
-            1,
-            7,
-            2,
-            10,
+            OrderId::new(1),
+            ClientOrderId::new(7),
+            InstrumentId::new(2),
+            AccountId::new(10),
             Side::Buy,
             OrderType::Limit,
             Price::new(100),
             Quantity::new(10),
         );
 
-        // When: we assign it to another variable
+        // When we assign it to another variable
         let copied_order = original_order;
 
-        // Then: both the original and copy can be used (Copy trait)
-        // Verify original is still usable
-        assert_eq!(original_order.id.inner(), 1);
-        assert_eq!(original_order.side, Side::Buy);
-        assert_eq!(original_order.order_type, OrderType::Limit);
-
-        // Verify copy is correct
-        assert_eq!(copied_order.id.inner(), 1);
-        assert_eq!(copied_order.side, Side::Buy);
-        assert_eq!(copied_order.order_type, OrderType::Limit);
-
-        // Verify both are equal
+        // Then both the original and copy can be used
         assert_eq!(original_order, copied_order);
+        assert_eq!(original_order.id.inner(), 1);
+        assert_eq!(copied_order.id.inner(), 1);
     }
 
     #[test]
-    fn side_enum_is_copy() {
-        // Given: a Side instance
+    fn side_and_order_type_are_copy() {
+        // Given a Side and an OrderType
         let original_side = Side::Buy;
-
-        // When: we assign it to another variable
-        let copied_side = original_side;
-
-        // Then: both can be used (Copy trait)
-        assert_eq!(original_side, Side::Buy);
-        assert_eq!(copied_side, Side::Buy);
-    }
-
-    #[test]
-    fn order_type_enum_is_copy() {
-        // Given: an OrderType instance
         let original_order_type = OrderType::Limit;
 
-        // When: we assign it to another variable
+        // When we assign each to another variable
+        let copied_side = original_side;
         let copied_order_type = original_order_type;
 
-        // Then: both can be used (Copy trait)
-        assert_eq!(original_order_type, OrderType::Limit);
-        assert_eq!(copied_order_type, OrderType::Limit);
+        // Then both the original and copy can be used
+        assert_eq!(original_side, copied_side);
+        assert_eq!(original_order_type, copied_order_type);
     }
 
     #[test]
     fn side_as_str_returns_correct_value() {
-        // Given: both sides
-        let buy_side = Side::Buy;
-        let sell_side = Side::Sell;
-
-        // When: we convert to string
-        let buy_str = buy_side.as_str();
-        let sell_str = sell_side.as_str();
-
-        // Then: correct string representations
-        assert_eq!(buy_str, "BUY");
-        assert_eq!(sell_str, "SELL");
+        // Given both sides
+        // When we convert them to strings
+        // Then the labels are BUY and SELL
+        assert_eq!(Side::Buy.as_str(), "BUY");
+        assert_eq!(Side::Sell.as_str(), "SELL");
     }
 
     #[test]
-    fn order_type_as_str_returns_correct_value() {
-        // Given: both order types
-        let limit_order = OrderType::Limit;
-        let market_order = OrderType::Market;
-
-        // When: we convert to string
-        let limit_str = limit_order.as_str();
-        let market_str = market_order.as_str();
-
-        // Then: correct string representations
-        assert_eq!(limit_str, "LIMIT");
-        assert_eq!(market_str, "MARKET");
-    }
-
-    #[test]
-    fn order_type_has_price_check() {
-        // Given: both order types
-        let limit_order = OrderType::Limit;
-        let market_order = OrderType::Market;
-
-        // When: we check if they have price
-        assert!(limit_order.has_price());
-        assert!(!market_order.has_price());
+    fn order_type_as_str_and_has_price() {
+        // Given both order types
+        // When we convert them to strings and check has_price
+        // Then limit has a live price and market does not
+        assert_eq!(OrderType::Limit.as_str(), "LIMIT");
+        assert_eq!(OrderType::Market.as_str(), "MARKET");
+        assert!(OrderType::Limit.has_price());
+        assert!(!OrderType::Market.has_price());
     }
 }

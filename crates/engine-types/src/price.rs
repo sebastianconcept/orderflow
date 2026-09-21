@@ -1,55 +1,46 @@
-//! Price type representing ticks as i64 values.
+//! Price tick count for an instrument.
 //!
-//! Price is a strongly-typed newtype around i64 that represents economic
-//! prices in ticks. This ensures type safety and prevents accidental mixing
-//! of price values with other integer quantities.
+//! When a command or event names an economic price, it uses this module so ticks
+//! stay a Price, not Quantity lots.
 
 use crate::instrument_spec::{price_from_decimal_string, InstrumentSpec};
 use crate::PriceParseError;
 
-/// Price in ticks (i64).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Price is the integer tick count of an economic price.
+/// When a command or event names a price, it uses this type so the value is ticks,
+/// not Quantity lots, and not a floating-point conversion.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Price(i64);
 
 impl Price {
-    /// Create a new Price from ticks.
+    /// Answers a Price from integer ticks.
     pub fn new(ticks: i64) -> Self {
         Price(ticks)
     }
 
-    /// Get the inner ticks value.
+    /// Answers the i64 tick count of this Price.
     pub fn inner(&self) -> i64 {
         self.0
     }
 
-    /// Create a new Price from an i64 value.
-    ///
-    /// This is an alias for `Price::new` and provides a more explicit
-    /// name when constructing from raw i64 values in codec contexts.
+    /// Answers a Price from an i64 tick count.
     pub fn from_i64(ticks: i64) -> Self {
         Price::new(ticks)
     }
 
-    /// Parse a decimal string into a Price (in ticks).
-    ///
-    /// This method parses a human-readable price string and converts it to
-    /// the exact integer tick count based on the instrument's display decimals.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The decimal string to parse (e.g., "100.25").
-    /// * `spec` - The instrument specification containing display decimal info.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Price)` - The parsed price in ticks.
-    /// * `Err(PriceParseError)` - If parsing fails (overflow, inexact fraction, etc.)
-    ///
-    /// # Examples
+    /// Answers Price ticks of display text for an instrument.
+    /// Requires the instrument display scale.
     ///
     /// ```
-    /// use engine_types::{InstrumentSpec, Price, Quantity};
-    /// let spec = InstrumentSpec::new(1, Price::new(1), Quantity::new(1), 2, 0, None);
+    /// use engine_types::{InstrumentId, InstrumentSpec, Price, Quantity};
+    /// let spec = InstrumentSpec::new(
+    ///     InstrumentId::new(1),
+    ///     Price::new(1),
+    ///     Quantity::new(1),
+    ///     2,
+    ///     0,
+    ///     None,
+    /// );
     /// let price = Price::from_decimal_string("100.25", &spec)?;
     /// assert_eq!(price.inner(), 10025);
     /// # Ok::<(), engine_types::PriceParseError>(())
@@ -60,6 +51,11 @@ impl Price {
     ) -> Result<Price, PriceParseError> {
         price_from_decimal_string(input, spec)
     }
+
+    /// Answers display text of this Price at the instrument scale.
+    pub fn to_decimal_string(&self, spec: &InstrumentSpec) -> String {
+        crate::instrument_spec::price_to_decimal_string(*self, spec)
+    }
 }
 
 #[cfg(test)]
@@ -68,7 +64,7 @@ mod tests {
 
     #[test]
     fn price_new_stores_i64_ticks() {
-        // Given: a i64 value representing ticks
+        // Given an i64 value representing ticks
         let original_ticks: i64 = 10025;
 
         // When we create a Price from it and extract the inner value
@@ -80,14 +76,14 @@ mod tests {
     }
 
     #[test]
-    fn price_and_quantity_are_copy() {
+    fn price_is_copy() {
         // Given a Price
         let price = Price::new(100);
 
         // When we assign it to another variable
         let copy = price;
 
-        // Then both the original and copy can be used (Copy trait)
+        // Then both the original and copy can be used
         assert_eq!(price.inner(), 100);
         assert_eq!(copy.inner(), 100);
     }

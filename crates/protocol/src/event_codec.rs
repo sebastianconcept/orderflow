@@ -1,176 +1,151 @@
-//! Event encoding and decoding for the protocol.
+//! Packed encode and decode of EngineEvent.
 //!
-//! This module provides serialization and deserialization of [`EngineEvent`]
-//! values into the compact binary format used in replayable event logs.
-//!
-//! # Wire Format
-//!
-//! Each event is encoded as a frame:
-//!
-//! - `frame_len` (u16, little-endian): Length of kind + payload
-//! - `kind` (u8): Opcode identifying the event type
-//! - `payload` (variable): Event-specific data
-//!
-//! # Opcodes
-//!
-//! | Kind | Name     |
-//! |------|----------|
-//! | 0x81 | Accepted |
-//! | 0x82 | Rejected |
-//! | 0x83 | Replaced |
-//! | 0x84 | Canceled |
-//! | 0x85 | Trade    |
-//!
-//! # Examples
+//! When a caller writes an event into a stream or datagram buffer, it uses this
+//! module so both envelopes share one payload layout.
 //!
 //! ```
-//! use engine_types::{AccountId, ClientOrderId, EngineEvent, InstrumentId, OrderId, Sequence, Side, TimestampNanos};
+//! use engine_types::{
+//!     AccountId, ClientOrderId, CommandSequence, EngineEvent, EventSequence, JournalSequence,
+//!     OrderId, TimestampNanos,
+//! };
 //! use protocol::event_codec;
 //!
-//! // Create an Accepted event
 //! let event = EngineEvent::Accepted {
-//!     sequence: Sequence::new(1),
+//!     event_sequence: EventSequence::new(1),
+//!     command_sequence: CommandSequence::new(0),
 //!     timestamp_nanos: TimestampNanos::new(1000),
 //!     order_id: OrderId::new(42),
 //!     client_order_id: ClientOrderId::new(7),
 //!     account_id: AccountId::new(1),
 //! };
-//!
-//! // Encode to bytes
-//! let mut buf = [0u8; 128];
-//! let encoded_len = event_codec::encode_event(&event, &mut buf);
-//!
-//! // Decode back
-//! let (decoded_evt, consumed) = event_codec::decode_event(&buf).expect("should decode successfully");
-//! assert_eq!(event, decoded_evt);
+//! let mut buffer = [0u8; 128];
+//! let encoded_len =
+//!     event_codec::encode_event(&event, JournalSequence::new(0), &mut buffer).expect("encode");
+//! let (decoded_event, journal_sequence, _consumed) =
+//!     event_codec::decode_event(&buffer).expect("decode");
+//! assert_eq!(event, decoded_event);
+//! assert_eq!(journal_sequence.inner(), 0);
+//! assert!(encoded_len > 0);
 //! ```
-//!
-//! # Error Handling
-//!
-//! Unknown opcodes return [`DecodeError::UnknownKind`]. Malformed data
-//! returns appropriate errors describing the failure.
 
+use displaydoc::Display;
 use engine_types::{
-    AccountId, ClientOrderId, EngineEvent, EngineEventRejectReason, InstrumentId, OrderId,
-    Sequence, TimestampNanos,
+    AccountId, ClientOrderId, CommandSequence, EngineEvent, EngineEventRejectReason, EventSequence,
+    InstrumentId, JournalSequence, OrderId, SessionId, TimestampNanos,
 };
-
-use crate::frame::{DecodeError as FrameDecodeError, Frame, FrameKind};
 use thiserror::Error;
 
-/// Error types for event decoding.
-#[derive(Error, Debug)]
+use crate::datagram::{
+    self, DecodeError as DatagramDecodeError, EncodeError as DatagramEncodeError,
+};
+use crate::frame::{
+    DecodeError as FrameDecodeError, EncodeError as FrameEncodeError, Frame, FrameKind,
+    FRAME_HEADER_SIZE,
+};
+use crate::packed_le::{read_i64, read_u128, read_u64};
+
+/// Failure of event frame decode.
+/// Frame errors, datagram errors, unknown kinds, and payload mismatches stay
+/// distinct.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The input buffer is too short to contain a valid frame.
-    #[error(transparent)]
-    Frame(#[from] FrameDecodeError),
-
-    /// The event kind is not recognized.
-    #[error("unknown event kind: {0:#04x}")]
+    /// Frame decode failed: {0}
+    Frame(#[source] FrameDecodeError),
+    /// Datagram decode failed: {0}
+    Datagram(#[source] DatagramDecodeError),
+    /// Unknown event kind: {0:#04x}
     UnknownKind(u8),
-
-    /// The payload is too short for the expected event type.
-    #[error("payload too short for event kind {kind:#04x}: expected at least {expected} bytes, got {actual}")]
-    PayloadTooShort {
+    /// Payload length is {actual} bytes, expected {expected} for kind {kind:#04x}
+    PayloadLengthMismatch {
         kind: u8,
         expected: usize,
         actual: usize,
     },
-
-    /// Failed to decode a required field from the payload.
-    #[error("failed to decode {field} from payload")]
-    FieldDecode { field: &'static str },
-
-    /// Invalid rejection reason value.
-    #[error("invalid rejection reason value: {0}")]
+    /// Invalid rejection reason value: {0}
     InvalidRejectionReason(u8),
 }
 
-/// Encode an EngineEvent to a byte buffer.
-///
-/// # Arguments
-///
-/// * `event` - The event to encode.
-/// * `buf` - Mutable buffer to write the encoded frame.
-///
-/// # Returns
-///
-/// The number of bytes written (frame header + payload).
-pub fn encode_event(event: &EngineEvent, buf: &mut [u8]) -> usize {
-    let kind = match event {
-        EngineEvent::Accepted { .. } => FrameKind::ACCEPTED,
-        EngineEvent::Rejected { .. } => FrameKind::REJECTED,
-        EngineEvent::Replaced { .. } => FrameKind::REPLACED,
-        EngineEvent::Canceled { .. } => FrameKind::CANCELED,
-        EngineEvent::Trade { .. } => FrameKind::TRADE,
-    };
-
-    let payload = encode_event_payload(event);
-    Frame::encode(kind, &payload, buf);
-
-    FRAME_HEADER_SIZE + payload.len()
+/// Failure of event frame encode.
+/// Frame and datagram packing failures stay distinct.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Frame encode failed: {0}
+    Frame(#[source] FrameEncodeError),
+    /// Datagram encode failed: {0}
+    Datagram(#[source] DatagramEncodeError),
 }
 
-/// Encode an event's payload into bytes.
-fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
+/// Answers the FrameKind of an EngineEvent variant.
+fn frame_kind_for_event(event: &EngineEvent) -> FrameKind {
+    match event {
+        EngineEvent::Accepted { .. } => FrameKind::Accepted,
+        EngineEvent::Rejected { .. } => FrameKind::Rejected,
+        EngineEvent::Replaced { .. } => FrameKind::Replaced,
+        EngineEvent::Canceled { .. } => FrameKind::Canceled,
+        EngineEvent::Trade { .. } => FrameKind::Trade,
+    }
+}
+
+/// Answers the shared packed payload of an EngineEvent.
+/// Stream and datagram envelopes wrap these bytes.
+pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
     let mut payload = Vec::new();
     match event {
         EngineEvent::Accepted {
-            sequence,
+            event_sequence,
+            command_sequence,
             timestamp_nanos,
             order_id,
             client_order_id,
             account_id,
         } => {
-            // Accepted payload: sequence u64, timestamp_nanos u64,
-            // order_id u64, client_order_id u64, account_id u64
-            payload.extend_from_slice(&sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
             payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
             payload.extend_from_slice(&order_id.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
             payload.extend_from_slice(&account_id.inner().to_le_bytes());
         }
         EngineEvent::Rejected {
-            sequence,
+            event_sequence,
+            command_sequence,
             timestamp_nanos,
             client_order_id,
             reason,
         } => {
-            // Rejected payload: sequence u64, timestamp_nanos u64,
-            // client_order_id u64, reason u8
-            payload.extend_from_slice(&sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
             payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-
-            // Encode rejection reason as u8
-            let reason_val = encode_rejection_reason(reason);
-            payload.push(reason_val);
+            payload.push(encode_rejection_reason(reason));
         }
         EngineEvent::Replaced {
-            sequence,
+            event_sequence,
+            command_sequence,
             timestamp_nanos,
             order_id,
             client_order_id,
         } => {
-            // Replaced payload: sequence u64, timestamp_nanos u64,
-            // order_id u64, client_order_id u64
-            payload.extend_from_slice(&sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
             payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
             payload.extend_from_slice(&order_id.inner().to_le_bytes());
             payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
         }
         EngineEvent::Canceled {
-            sequence,
+            event_sequence,
+            command_sequence,
             timestamp_nanos,
             order_id,
         } => {
-            // Canceled payload: sequence u64, timestamp_nanos u64, order_id u64
-            payload.extend_from_slice(&sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
             payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
             payload.extend_from_slice(&order_id.inner().to_le_bytes());
         }
         EngineEvent::Trade {
-            sequence,
+            event_sequence,
+            command_sequence,
             timestamp_nanos,
             maker_order_id,
             taker_order_id,
@@ -178,10 +153,8 @@ fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             price,
             quantity,
         } => {
-            // Trade payload: sequence u64, timestamp_nanos u64,
-            // maker_order_id u64, taker_order_id u64, instrument_id u64,
-            // price i64, quantity u128
-            payload.extend_from_slice(&sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
+            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
             payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
             payload.extend_from_slice(&maker_order_id.inner().to_le_bytes());
             payload.extend_from_slice(&taker_order_id.inner().to_le_bytes());
@@ -190,11 +163,10 @@ fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             payload.extend_from_slice(&quantity.inner().to_le_bytes());
         }
     }
-
     payload
 }
 
-/// Encode a rejection reason to its wire value.
+/// Answers the wire byte for an EngineEventRejectReason (0–3 named, 255 = Other).
 fn encode_rejection_reason(reason: &EngineEventRejectReason) -> u8 {
     match reason {
         EngineEventRejectReason::InvalidQuantity => 0,
@@ -205,382 +177,8 @@ fn encode_rejection_reason(reason: &EngineEventRejectReason) -> u8 {
     }
 }
 
-/// Decode an EngineEvent from a byte slice.
-///
-/// # Arguments
-///
-/// * `buf` - The byte slice containing an encoded event frame.
-///
-/// # Returns
-///
-/// * `Ok((EngineEvent, consumed))` - The decoded event and number of bytes consumed.
-/// * `Err(DecodeError)` - If decoding fails (unknown kind, truncated payload, etc.).
-pub fn decode_event(buf: &[u8]) -> Result<(EngineEvent, usize), DecodeError> {
-    // First decode the frame to get kind and payload
-    let result = Frame::decode(buf);
-
-    // Handle the frame decode result - re-raise UnknownKind directly
-    let (kind, payload) = match result {
-        Ok((k, p)) => (k, p),
-        Err(FrameDecodeError::UnknownKind(kind_val)) => {
-            // Re-raise UnknownKind as our own error
-            return Err(DecodeError::UnknownKind(kind_val));
-        }
-        Err(e) => {
-            // Wrap other errors
-            return Err(DecodeError::Frame(e));
-        }
-    };
-
-    // Extract kind value
-    let kind_val = kind.inner();
-
-    // Decode the event based on kind
-    match kind_val {
-        0x81 => decode_accepted_event(payload).map(|evt| (evt, FRAME_HEADER_SIZE + payload.len())),
-        0x82 => decode_rejected_event(payload).map(|evt| (evt, FRAME_HEADER_SIZE + payload.len())),
-        0x83 => decode_replaced_event(payload).map(|evt| (evt, FRAME_HEADER_SIZE + payload.len())),
-        0x84 => decode_canceled_event(payload).map(|evt| (evt, FRAME_HEADER_SIZE + payload.len())),
-        0x85 => decode_trade_event(payload).map(|evt| (evt, FRAME_HEADER_SIZE + payload.len())),
-        _ => Err(DecodeError::UnknownKind(kind_val)),
-    }
-}
-
-/// Decode an Accepted event from its payload.
-fn decode_accepted_event(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 40; // sequence(8) + timestamp_nanos(8) + order_id(8) +
-                                    // client_order_id(8) + account_id(8)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x81,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let timestamp_nanos = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let order_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    let client_order_id = u64::from_le_bytes([
-        payload[24],
-        payload[25],
-        payload[26],
-        payload[27],
-        payload[28],
-        payload[29],
-        payload[30],
-        payload[31],
-    ]);
-
-    let account_id = u64::from_le_bytes([
-        payload[32],
-        payload[33],
-        payload[34],
-        payload[35],
-        payload[36],
-        payload[37],
-        payload[38],
-        payload[39],
-    ]);
-
-    Ok(EngineEvent::Accepted {
-        sequence: Sequence::new(sequence),
-        timestamp_nanos: TimestampNanos::new(timestamp_nanos),
-        order_id: OrderId::new(order_id),
-        client_order_id: ClientOrderId::new(client_order_id),
-        account_id: AccountId::new(account_id),
-    })
-}
-
-/// Decode a Rejected event from its payload.
-fn decode_rejected_event(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 25; // sequence(8) + timestamp_nanos(8) + client_order_id(8) +
-                                    // reason(1)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x82,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let timestamp_nanos = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let client_order_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    let reason_val = payload[24];
-    let reason = decode_rejection_reason(reason_val)?;
-
-    Ok(EngineEvent::Rejected {
-        sequence: Sequence::new(sequence),
-        timestamp_nanos: TimestampNanos::new(timestamp_nanos),
-        client_order_id: ClientOrderId::new(client_order_id),
-        reason,
-    })
-}
-
-/// Decode a Replaced event from its payload.
-fn decode_replaced_event(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 32; // sequence(8) + timestamp_nanos(8) + order_id(8) +
-                                    // client_order_id(8)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x83,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let timestamp_nanos = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let order_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    let client_order_id = u64::from_le_bytes([
-        payload[24],
-        payload[25],
-        payload[26],
-        payload[27],
-        payload[28],
-        payload[29],
-        payload[30],
-        payload[31],
-    ]);
-
-    Ok(EngineEvent::Replaced {
-        sequence: Sequence::new(sequence),
-        timestamp_nanos: TimestampNanos::new(timestamp_nanos),
-        order_id: OrderId::new(order_id),
-        client_order_id: ClientOrderId::new(client_order_id),
-    })
-}
-
-/// Decode a Canceled event from its payload.
-fn decode_canceled_event(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 24; // sequence(8) + timestamp_nanos(8) + order_id(8)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x84,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let timestamp_nanos = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let order_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    Ok(EngineEvent::Canceled {
-        sequence: Sequence::new(sequence),
-        timestamp_nanos: TimestampNanos::new(timestamp_nanos),
-        order_id: OrderId::new(order_id),
-    })
-}
-
-/// Decode a Trade event from its payload.
-fn decode_trade_event(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 64; // sequence(8) + timestamp_nanos(8) + maker_order_id(8) +
-                                    // taker_order_id(8) + instrument_id(8) + price(8) + quantity(16)
-
-    if payload.len() < EXPECTED_LEN {
-        return Err(DecodeError::PayloadTooShort {
-            kind: 0x85,
-            expected: EXPECTED_LEN,
-            actual: payload.len(),
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-
-    let timestamp_nanos = u64::from_le_bytes([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-    ]);
-
-    let maker_order_id = u64::from_le_bytes([
-        payload[16],
-        payload[17],
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
-
-    let taker_order_id = u64::from_le_bytes([
-        payload[24],
-        payload[25],
-        payload[26],
-        payload[27],
-        payload[28],
-        payload[29],
-        payload[30],
-        payload[31],
-    ]);
-
-    let instrument_id = u64::from_le_bytes([
-        payload[32],
-        payload[33],
-        payload[34],
-        payload[35],
-        payload[36],
-        payload[37],
-        payload[38],
-        payload[39],
-    ]);
-
-    let price = i64::from_le_bytes([
-        payload[40],
-        payload[41],
-        payload[42],
-        payload[43],
-        payload[44],
-        payload[45],
-        payload[46],
-        payload[47],
-    ]);
-
-    let quantity_bytes = [
-        payload[48],
-        payload[49],
-        payload[50],
-        payload[51],
-        payload[52],
-        payload[53],
-        payload[54],
-        payload[55],
-        payload[56],
-        payload[57],
-        payload[58],
-        payload[59],
-        payload[60],
-        payload[61],
-        payload[62],
-        payload[63],
-    ];
-    let quantity = u128::from_le_bytes(quantity_bytes);
-
-    Ok(EngineEvent::Trade {
-        sequence: Sequence::new(sequence),
-        timestamp_nanos: TimestampNanos::new(timestamp_nanos),
-        maker_order_id: OrderId::new(maker_order_id),
-        taker_order_id: OrderId::new(taker_order_id),
-        instrument_id: InstrumentId::new(instrument_id),
-        price: engine_types::Price::from_i64(price),
-        quantity: engine_types::Quantity::from_u128(quantity),
-    })
-}
-
-/// Size of the frame header (frame_len + kind).
-pub const FRAME_HEADER_SIZE: usize = 3;
-
-/// Decode a rejection reason from its wire value.
+/// Answers the EngineEventRejectReason of a wire byte; unrecognised values are
+/// InvalidRejectionReason.
 fn decode_rejection_reason(value: u8) -> Result<EngineEventRejectReason, DecodeError> {
     match value {
         0 => Ok(EngineEventRejectReason::InvalidQuantity),
@@ -588,363 +186,325 @@ fn decode_rejection_reason(value: u8) -> Result<EngineEventRejectReason, DecodeE
         2 => Ok(EngineEventRejectReason::OrderNotFound),
         3 => Ok(EngineEventRejectReason::InvalidPrice),
         255 => Ok(EngineEventRejectReason::Other),
-        _ => Err(DecodeError::InvalidRejectionReason(value)),
+        other => Err(DecodeError::InvalidRejectionReason(other)),
     }
+}
+
+/// Answers a packed stream frame of an EngineEvent.
+pub fn encode_event(
+    event: &EngineEvent,
+    journal_sequence: JournalSequence,
+    buffer: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let kind = frame_kind_for_event(event);
+    let payload = encode_event_payload(event);
+    Frame::encode(kind, journal_sequence, &payload, buffer).map_err(EncodeError::Frame)
+}
+
+/// Answers an EngineEvent of a shared event payload.
+pub fn decode_event_payload(kind: FrameKind, payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    match kind {
+        FrameKind::Accepted => decode_accepted(payload),
+        FrameKind::Rejected => decode_rejected(payload),
+        FrameKind::Replaced => decode_replaced(payload),
+        FrameKind::Canceled => decode_canceled(payload),
+        FrameKind::Trade => decode_trade(payload),
+        other => Err(DecodeError::UnknownKind(other.encode())),
+    }
+}
+
+/// Answers an EngineEvent of a packed stream frame.
+pub fn decode_event(buffer: &[u8]) -> Result<(EngineEvent, JournalSequence, usize), DecodeError> {
+    let (kind, journal_sequence, payload) = match Frame::decode(buffer) {
+        Ok(decoded) => decoded,
+        Err(FrameDecodeError::UnknownKind(unknown_kind)) => {
+            return Err(DecodeError::UnknownKind(unknown_kind));
+        }
+        Err(frame_error) => {
+            return Err(DecodeError::Frame(frame_error));
+        }
+    };
+    let consumed = FRAME_HEADER_SIZE + payload.len();
+    let event = decode_event_payload(kind, payload)?;
+    Ok((event, journal_sequence, consumed))
+}
+
+/// Answers a packed datagram of an EngineEvent.
+pub fn encode_event_datagram(
+    event: &EngineEvent,
+    session_id: SessionId,
+    journal_sequence: JournalSequence,
+    buffer: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let kind = frame_kind_for_event(event);
+    let payload = encode_event_payload(event);
+    datagram::encode(session_id, journal_sequence, kind, &payload, buffer)
+        .map_err(EncodeError::Datagram)
+}
+
+/// Answers an EngineEvent of a packed datagram.
+pub fn decode_event_datagram(
+    buffer: &[u8],
+) -> Result<(EngineEvent, SessionId, JournalSequence), DecodeError> {
+    let (session_id, journal_sequence, kind, payload) = match datagram::decode(buffer) {
+        Ok(decoded) => decoded,
+        Err(DatagramDecodeError::UnknownKind(unknown_kind)) => {
+            return Err(DecodeError::UnknownKind(unknown_kind));
+        }
+        Err(datagram_error) => {
+            return Err(DecodeError::Datagram(datagram_error));
+        }
+    };
+    let event = decode_event_payload(kind, payload)?;
+    Ok((event, session_id, journal_sequence))
+}
+
+/// Answers an EngineEvent::Accepted of a payload, or a length mismatch when the
+/// payload is not exactly 48 bytes.
+fn decode_accepted(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    const EXPECTED_LEN: usize = 48;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Accepted.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(EngineEvent::Accepted {
+        event_sequence: EventSequence::new(read_u64(payload, 0)),
+        command_sequence: CommandSequence::new(read_u64(payload, 8)),
+        timestamp_nanos: TimestampNanos::new(read_u64(payload, 16)),
+        order_id: OrderId::new(read_u64(payload, 24)),
+        client_order_id: ClientOrderId::new(read_u64(payload, 32)),
+        account_id: AccountId::new(read_u64(payload, 40)),
+    })
+}
+
+/// Answers an EngineEvent::Rejected of a payload, or a length mismatch when the
+/// payload is not exactly 33 bytes.
+fn decode_rejected(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    const EXPECTED_LEN: usize = 33;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Rejected.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(EngineEvent::Rejected {
+        event_sequence: EventSequence::new(read_u64(payload, 0)),
+        command_sequence: CommandSequence::new(read_u64(payload, 8)),
+        timestamp_nanos: TimestampNanos::new(read_u64(payload, 16)),
+        client_order_id: ClientOrderId::new(read_u64(payload, 24)),
+        reason: decode_rejection_reason(payload[32])?,
+    })
+}
+
+/// Answers an EngineEvent::Replaced of a payload, or a length mismatch when the
+/// payload is not exactly 40 bytes.
+fn decode_replaced(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    const EXPECTED_LEN: usize = 40;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Replaced.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(EngineEvent::Replaced {
+        event_sequence: EventSequence::new(read_u64(payload, 0)),
+        command_sequence: CommandSequence::new(read_u64(payload, 8)),
+        timestamp_nanos: TimestampNanos::new(read_u64(payload, 16)),
+        order_id: OrderId::new(read_u64(payload, 24)),
+        client_order_id: ClientOrderId::new(read_u64(payload, 32)),
+    })
+}
+
+/// Answers an EngineEvent::Canceled of a payload, or a length mismatch when the
+/// payload is not exactly 32 bytes.
+fn decode_canceled(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    const EXPECTED_LEN: usize = 32;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Canceled.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(EngineEvent::Canceled {
+        event_sequence: EventSequence::new(read_u64(payload, 0)),
+        command_sequence: CommandSequence::new(read_u64(payload, 8)),
+        timestamp_nanos: TimestampNanos::new(read_u64(payload, 16)),
+        order_id: OrderId::new(read_u64(payload, 24)),
+    })
+}
+
+/// Answers an EngineEvent::Trade of a payload, or a length mismatch when the
+/// payload is not exactly 72 bytes.
+fn decode_trade(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
+    const EXPECTED_LEN: usize = 72;
+    if payload.len() != EXPECTED_LEN {
+        return Err(DecodeError::PayloadLengthMismatch {
+            kind: FrameKind::Trade.encode(),
+            expected: EXPECTED_LEN,
+            actual: payload.len(),
+        });
+    }
+    Ok(EngineEvent::Trade {
+        event_sequence: EventSequence::new(read_u64(payload, 0)),
+        command_sequence: CommandSequence::new(read_u64(payload, 8)),
+        timestamp_nanos: TimestampNanos::new(read_u64(payload, 16)),
+        maker_order_id: OrderId::new(read_u64(payload, 24)),
+        taker_order_id: OrderId::new(read_u64(payload, 32)),
+        instrument_id: InstrumentId::new(read_u64(payload, 40)),
+        price: engine_types::Price::from_i64(read_i64(payload, 48)),
+        quantity: engine_types::Quantity::from_u128(read_u128(payload, 56)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_types::{Price, Quantity};
 
-    /// Test that Accepted event round-trips through encode/decode.
-    #[test]
-    fn event_codec_accepted_round_trips() {
-        // Given: an Accepted event
-        let event = EngineEvent::Accepted {
-            sequence: Sequence::new(1),
+    fn sample_accepted() -> EngineEvent {
+        EngineEvent::Accepted {
+            event_sequence: EventSequence::new(1),
+            command_sequence: CommandSequence::new(10),
             timestamp_nanos: TimestampNanos::new(1000),
             order_id: OrderId::new(42),
             client_order_id: ClientOrderId::new(7),
             account_id: AccountId::new(1),
-        };
+        }
+    }
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_event(&event, &mut buf);
+    #[test]
+    fn event_codec_accepted_round_trips() {
+        // Given an Accepted event
+        let event = sample_accepted();
+        let mut buffer = [0u8; 128];
 
-        let (decoded_evt, consumed) = decode_event(&buf).expect("decode should succeed");
+        // When we encode and decode on the stream envelope
+        let encoded_len =
+            encode_event(&event, JournalSequence::new(5), &mut buffer).expect("encode");
+        let (decoded, journal_sequence, consumed) = decode_event(&buffer).expect("decode");
 
-        // Then: round trip preserves event
-        assert_eq!(event, decoded_evt);
+        // Then round trip preserves the event and JournalSequence
+        assert_eq!(decoded, event);
+        assert_eq!(journal_sequence.inner(), 5);
         assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit (128 bytes max per SPECS)
         assert!(encoded_len <= 128);
     }
 
-    /// Test that Trade event round-trips with maker and taker order IDs.
     #[test]
-    fn event_codec_trade_round_trips_maker_taker_price_quantity() {
-        // Given: a Trade event with all fields
+    fn event_sequence_independent_of_command_sequence_on_wire() {
+        // Given an Accepted whose clocks differ
+        let event = sample_accepted();
+        let payload = encode_event_payload(&event);
+
+        // When we read the first two u64 fields
+        let event_sequence = crate::packed_le::read_u64(&payload, 0);
+        let command_sequence = crate::packed_le::read_u64(&payload, 8);
+
+        // Then they remain distinct on the wire
+        assert_eq!(event_sequence, 1);
+        assert_eq!(command_sequence, 10);
+    }
+
+    #[test]
+    fn trade_payload_stays_within_128_bytes() {
+        // Given a Trade event
         let event = EngineEvent::Trade {
-            sequence: Sequence::new(5),
+            event_sequence: EventSequence::new(5),
+            command_sequence: CommandSequence::new(14),
             timestamp_nanos: TimestampNanos::new(5000),
             maker_order_id: OrderId::new(10),
             taker_order_id: OrderId::new(20),
             instrument_id: InstrumentId::new(2),
-            price: engine_types::Price::new(100),
-            quantity: engine_types::Quantity::new(5),
+            price: Price::new(100),
+            quantity: Quantity::new(5),
         };
+        let payload = encode_event_payload(&event);
+        let mut datagram = [0u8; 512];
+        let encoded_len = encode_event_datagram(
+            &event,
+            SessionId::new(1),
+            JournalSequence::new(0),
+            &mut datagram,
+        )
+        .expect("encode");
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_event(&event, &mut buf);
-
-        let (decoded_evt, consumed) = decode_event(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves event
-        assert_eq!(event, decoded_evt);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit (128 bytes max per SPECS)
-        assert!(encoded_len <= 128);
-
-        // Verify Trade-specific fields
-        match decoded_evt {
-            EngineEvent::Trade {
-                maker_order_id,
-                taker_order_id,
-                price,
-                quantity,
-                ..
-            } => {
-                assert_eq!(maker_order_id.inner(), 10);
-                assert_eq!(taker_order_id.inner(), 20);
-                assert_eq!(price.inner(), 100);
-                assert_eq!(quantity.inner(), 5);
-            }
-            _ => panic!("Expected Trade variant"),
-        }
+        // When we measure sizes
+        // Then payload is at most 128 and the datagram is under 512
+        assert!(payload.len() <= 128);
+        assert!(encoded_len <= 512);
+        assert_eq!(payload.len(), 72);
     }
 
-    /// Test that Rejected event with Other reason round-trips.
     #[test]
-    fn event_codec_rejected_round_trips_reason_other() {
-        // Given: a Rejected event with Other reason (wire value 255)
+    fn stream_and_datagram_round_trip_same_payload() {
+        // Given an Accepted event
+        let event = sample_accepted();
+        let session_id = SessionId::new(42);
+        let journal_sequence = JournalSequence::new(11);
+        let mut stream_buf = [0u8; 128];
+        let mut datagram_buf = [0u8; 128];
+
+        // When we encode both envelopes
+        encode_event(&event, journal_sequence, &mut stream_buf).expect("stream");
+        let datagram_len =
+            encode_event_datagram(&event, session_id, journal_sequence, &mut datagram_buf)
+                .expect("datagram");
+        let (stream_decoded, _, _) = decode_event(&stream_buf).expect("stream decode");
+        let (datagram_decoded, _, _) =
+            decode_event_datagram(&datagram_buf[..datagram_len]).expect("datagram");
+
+        // Then both envelopes yield the same event payload
+        assert_eq!(stream_decoded, event);
+        assert_eq!(datagram_decoded, event);
+        assert_eq!(
+            encode_event_payload(&stream_decoded),
+            encode_event_payload(&datagram_decoded)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_invalid_rejection_reason() {
+        // Given a Rejected payload whose reason byte is not in the closed set
         let event = EngineEvent::Rejected {
-            sequence: Sequence::new(2),
-            timestamp_nanos: TimestampNanos::new(2000),
-            client_order_id: ClientOrderId::new(7),
-            reason: EngineEventRejectReason::Other,
-        };
-
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_event(&event, &mut buf);
-
-        let (decoded_evt, consumed) = decode_event(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves event
-        assert_eq!(event, decoded_evt);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify reason is Other
-        match decoded_evt {
-            EngineEvent::Rejected { reason, .. } => {
-                assert_eq!(reason, EngineEventRejectReason::Other);
-            }
-            _ => panic!("Expected Rejected variant"),
-        }
-
-        // Verify size is within limit
-        assert!(encoded_len <= 128);
-    }
-
-    /// Test that all rejection reasons round-trip correctly.
-    #[test]
-    fn event_codec_rejected_round_trips_all_reasons() {
-        let reasons = vec![
-            EngineEventRejectReason::InvalidQuantity,
-            EngineEventRejectReason::UnknownInstrument,
-            EngineEventRejectReason::OrderNotFound,
-            EngineEventRejectReason::InvalidPrice,
-            EngineEventRejectReason::Other,
-        ];
-
-        for reason in reasons {
-            let event = EngineEvent::Rejected {
-                sequence: Sequence::new(1),
-                timestamp_nanos: TimestampNanos::new(1000),
-                client_order_id: ClientOrderId::new(7),
-                reason,
-            };
-
-            let mut buf = [0u8; 128];
-            let encoded_len = encode_event(&event, &mut buf);
-
-            let (decoded_evt, _) = decode_event(&buf).expect("decode should succeed");
-
-            match decoded_evt {
-                EngineEvent::Rejected {
-                    reason: decoded_reason,
-                    ..
-                } => {
-                    assert_eq!(reason, decoded_reason);
-                }
-                _ => panic!("Expected Rejected variant"),
-            }
-
-            assert!(encoded_len <= 128);
-        }
-    }
-
-    /// Test that unknown kind returns decode error.
-    #[test]
-    fn event_codec_unknown_kind_returns_decode_error() {
-        // Given: a buffer with unknown kind (0xFF)
-        let mut buf = [0u8; 10];
-        // frame_len = 2 (kind + 1 byte payload)
-        buf[0..2].copy_from_slice(&2u16.to_le_bytes());
-        // Unknown kind
-        buf[2] = 0xFF;
-        // Payload byte
-        buf[3] = 0x00;
-
-        // When: we try to decode
-        let result = decode_event(&buf);
-
-        // Then: it returns an error about unknown kind
-        assert!(matches!(result, Err(DecodeError::UnknownKind(0xFF))));
-    }
-
-    /// Test that truncated payload returns error.
-    #[test]
-    fn event_codec_truncated_payload_returns_error() {
-        // Given: a buffer with Accepted frame but truncated payload
-        let mut buf = [0u8; 30]; // claims more than it has
-                                 // frame_len = 45 (claiming 45 bytes after header)
-        buf[0..2].copy_from_slice(&45u16.to_le_bytes());
-        // Valid kind (Accepted = 0x81)
-        buf[2] = FrameKind::ACCEPTED.encode();
-
-        // When: we try to decode
-        let result = decode_event(&buf);
-
-        // Then: it returns an error about payload too short (wrapped in Frame)
-        assert!(matches!(
-            result,
-            Err(DecodeError::Frame(FrameDecodeError::PayloadTooShort { .. }))
-        ));
-    }
-
-    /// Test that decode validates rejection reason values.
-    #[test]
-    fn event_codec_rejected_decode_validates_reason_value() {
-        // Given: a Rejected payload with invalid reason value (100)
-        let mut buf = [0u8; 30];
-        // frame_len = 27 (kind + payload)
-        buf[0..2].copy_from_slice(&27u16.to_le_bytes());
-        // Valid kind (Rejected = 0x82)
-        buf[2] = FrameKind::REJECTED.encode();
-
-        // Write valid values for first 24 bytes
-        buf[3..11].copy_from_slice(&1u64.to_le_bytes()); // sequence
-        buf[11..19].copy_from_slice(&1000u64.to_le_bytes()); // timestamp_nanos
-        buf[19..27].copy_from_slice(&7u64.to_le_bytes()); // client_order_id
-
-        // Invalid reason value (100)
-        buf[27] = 100;
-
-        // When: we try to decode
-        let result = decode_event(&buf);
-
-        // Then: it returns an error about invalid rejection reason
-        assert!(matches!(
-            result,
-            Err(DecodeError::InvalidRejectionReason(_))
-        ));
-    }
-
-    /// Test that encode produces expected byte sizes for each event type.
-    #[test]
-    fn event_codec_expected_sizes() {
-        // Accepted: 3 (header) + 40 (payload) = 43 bytes
-        let accepted_evt = EngineEvent::Accepted {
-            sequence: Sequence::new(1),
-            timestamp_nanos: TimestampNanos::new(1000),
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(7),
-            account_id: AccountId::new(1),
-        };
-        let mut buf = [0u8; 128];
-        assert_eq!(encode_event(&accepted_evt, &mut buf), 43);
-
-        // Rejected: 3 (header) + 25 (payload) = 28 bytes
-        let rejected_evt = EngineEvent::Rejected {
-            sequence: Sequence::new(2),
+            event_sequence: EventSequence::new(2),
+            command_sequence: CommandSequence::new(11),
             timestamp_nanos: TimestampNanos::new(2000),
             client_order_id: ClientOrderId::new(7),
             reason: EngineEventRejectReason::InvalidQuantity,
         };
-        assert_eq!(encode_event(&rejected_evt, &mut buf), 28);
+        let mut payload = encode_event_payload(&event);
+        payload[32] = 4;
 
-        // Replaced: 3 (header) + 32 (payload) = 35 bytes
-        let replaced_evt = EngineEvent::Replaced {
-            sequence: Sequence::new(3),
-            timestamp_nanos: TimestampNanos::new(3000),
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(99),
-        };
-        assert_eq!(encode_event(&replaced_evt, &mut buf), 35);
+        // When we decode the payload
+        let result = decode_event_payload(FrameKind::Rejected, &payload);
 
-        // Canceled: 3 (header) + 24 (payload) = 27 bytes
-        let canceled_evt = EngineEvent::Canceled {
-            sequence: Sequence::new(4),
-            timestamp_nanos: TimestampNanos::new(4000),
-            order_id: OrderId::new(42),
-        };
-        assert_eq!(encode_event(&canceled_evt, &mut buf), 27);
-
-        // Trade: 3 (header) + 64 (payload) = 67 bytes
-        let trade_evt = EngineEvent::Trade {
-            sequence: Sequence::new(5),
-            timestamp_nanos: TimestampNanos::new(5000),
-            maker_order_id: OrderId::new(10),
-            taker_order_id: OrderId::new(20),
-            instrument_id: InstrumentId::new(2),
-            price: engine_types::Price::new(100),
-            quantity: engine_types::Quantity::new(5),
-        };
-        assert_eq!(encode_event(&trade_evt, &mut buf), 67);
+        // Then decode names the invalid reason byte
+        assert_eq!(result, Err(DecodeError::InvalidRejectionReason(4)));
     }
 
-    /// Test that Replaced event round-trips correctly.
     #[test]
-    fn event_codec_replaced_round_trips() {
-        // Given: a Replaced event
-        let event = EngineEvent::Replaced {
-            sequence: Sequence::new(3),
-            timestamp_nanos: TimestampNanos::new(3000),
-            order_id: OrderId::new(42),
-            client_order_id: ClientOrderId::new(99),
-        };
+    fn decode_rejects_accepted_payload_length_mismatch() {
+        // Given an Accepted payload that is one byte short
+        let payload = encode_event_payload(&sample_accepted());
+        let short_payload = &payload[..payload.len() - 1];
 
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_event(&event, &mut buf);
+        // When we decode the payload
+        let result = decode_event_payload(FrameKind::Accepted, short_payload);
 
-        let (decoded_evt, consumed) = decode_event(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves event
-        assert_eq!(event, decoded_evt);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit
-        assert!(encoded_len <= 128);
-    }
-
-    /// Test that Canceled event round-trips correctly.
-    #[test]
-    fn event_codec_canceled_round_trips() {
-        // Given: a Canceled event
-        let event = EngineEvent::Canceled {
-            sequence: Sequence::new(4),
-            timestamp_nanos: TimestampNanos::new(4000),
-            order_id: OrderId::new(42),
-        };
-
-        // When: we encode and decode
-        let mut buf = [0u8; 128];
-        let encoded_len = encode_event(&event, &mut buf);
-
-        let (decoded_evt, consumed) = decode_event(&buf).expect("decode should succeed");
-
-        // Then: round trip preserves event
-        assert_eq!(event, decoded_evt);
-        assert_eq!(encoded_len, consumed);
-
-        // Verify size is within limit
-        assert!(encoded_len <= 128);
-    }
-
-    /// Test that multiple events can be encoded and decoded sequentially.
-    #[test]
-    fn event_codec_multiple_events_round_trip() {
-        // Given: multiple events
-        #[allow(clippy::useless_vec)]
-        let events = vec![
-            EngineEvent::Accepted {
-                sequence: Sequence::new(1),
-                timestamp_nanos: TimestampNanos::new(1000),
-                order_id: OrderId::new(42),
-                client_order_id: ClientOrderId::new(7),
-                account_id: AccountId::new(1),
-            },
-            EngineEvent::Trade {
-                sequence: Sequence::new(2),
-                timestamp_nanos: TimestampNanos::new(2000),
-                maker_order_id: OrderId::new(42),
-                taker_order_id: OrderId::new(99),
-                instrument_id: InstrumentId::new(2),
-                price: engine_types::Price::new(100),
-                quantity: engine_types::Quantity::new(5),
-            },
-            EngineEvent::Rejected {
-                sequence: Sequence::new(3),
-                timestamp_nanos: TimestampNanos::new(3000),
-                client_order_id: ClientOrderId::new(7),
-                reason: EngineEventRejectReason::InvalidQuantity,
-            },
-        ];
-
-        // When: we encode each event into separate buffers
-        let mut bufs = vec![[0u8; 128]; events.len()];
-        for (i, evt) in events.iter().enumerate() {
-            let encoded_len = encode_event(evt, &mut bufs[i]);
-            let (decoded_evt, consumed) = decode_event(&bufs[i]).expect("decode should succeed");
-            assert_eq!(*evt, decoded_evt);
-            assert_eq!(encoded_len, consumed);
-            assert!(encoded_len <= 128);
-        }
+        // Then decode names the expected Accepted length
+        assert_eq!(
+            result,
+            Err(DecodeError::PayloadLengthMismatch {
+                kind: FrameKind::Accepted.encode(),
+                expected: 48,
+                actual: 47,
+            })
+        );
     }
 }

@@ -1,34 +1,45 @@
+//! Name and version of a Tokio matching engine.
+//!
+//! When Engine receives a parameter set, it uses this module so name and
+//! version are complete.
+
+/// EngineConfig is the name and version of a Tokio matching engine.
+/// When Engine is constructed, it uses this type so name and version are a
+/// complete set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Config {
+pub struct EngineConfig {
     pub name: String,
     pub version: String,
 }
 
-impl Config {
+impl EngineConfig {
+    /// Answers an EngineConfig from name and version.
     pub fn new(name: &str, version: &str) -> Self {
-        Config {
+        EngineConfig {
             name: name.to_string(),
             version: version.to_string(),
         }
     }
 
+    /// Answers an EngineConfig with test name and version.
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Config {
+        EngineConfig {
             name: "Test tokio Engine".to_string(),
             version: "0.1.0".to_string(),
         }
     }
 
+    /// Answers the default name and version for this engine.
     pub fn default_config() -> Self {
-        Config {
+        EngineConfig {
             name: "Default tokio Matching Engine".to_string(),
             version: "0.1.0".to_string(),
         }
     }
 }
 
-impl Default for Config {
+impl Default for EngineConfig {
     fn default() -> Self {
         Self::default_config()
     }

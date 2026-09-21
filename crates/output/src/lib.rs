@@ -1,25 +1,23 @@
-// Output sink – placeholder implementation
+//! Publish of engine events out of the pipeline.
+//!
+//! When a caller hands an EngineEvent to an output stage, it uses this module.
+//! publish leaves the event unpublished.
 
 use engine_types::EngineEvent;
 
+/// OutputSink is the publish of engine events out of the pipeline.
+/// When a caller hands an EngineEvent to an output stage, it uses this type.
+/// publish leaves the event unpublished.
 pub struct OutputSink;
 
 impl OutputSink {
+    /// Answers an OutputSink.
     pub fn new() -> Self {
         Self
     }
 
-    /// Publish an engine event.
-    ///
-    /// This is a placeholder that accepts any EngineEvent variant without processing.
-    /// Real output implementations will handle events based on their variant.
-    ///
-    /// # Arguments
-    ///
-    /// * `_event` - The engine event to publish (Accepted, Rejected, Replaced, Canceled, or Trade)
-    pub fn publish(&self, _event: &EngineEvent) {
-        // TODO: real output implementation
-    }
+    /// Leaves the engine event unpublished.
+    pub fn publish(&self, _event: &EngineEvent) {}
 }
 
 impl Default for OutputSink {
@@ -32,95 +30,63 @@ impl Default for OutputSink {
 mod tests {
     use super::*;
     use engine_types::{
-        AccountId, ClientOrderId, EngineEvent, EngineEventRejectReason, InstrumentId, OrderId,
-        Price, Quantity, Sequence, TimestampNanos,
+        AccountId, ClientOrderId, CommandSequence, EngineEvent, EngineEventRejectReason,
+        EventSequence, InstrumentId, OrderId, Price, Quantity, TimestampNanos,
     };
 
-    /// Test that OutputSink can be constructed with the new method.
-    #[test]
-    fn sink_new_constructs() {
-        // When: creating a new OutputSink
-        let _sink = OutputSink::new();
-
-        // Then: it should be successfully created (no panic)
-    }
-
-    /// Test that publish accepts a Trade event without panicking.
-    #[test]
-    fn publish_accepts_trade_event_without_panic() {
-        // Given: a Trade event with all required fields
-        let trade_event = EngineEvent::Trade {
-            sequence: Sequence::new(1),
+    fn sample_trade() -> EngineEvent {
+        EngineEvent::Trade {
+            event_sequence: EventSequence::new(1),
+            command_sequence: CommandSequence::new(0),
             timestamp_nanos: TimestampNanos::new(1000),
             maker_order_id: OrderId::new(10),
             taker_order_id: OrderId::new(20),
             instrument_id: InstrumentId::new(2),
             price: Price::new(100),
             quantity: Quantity::new(5),
-        };
-
-        let sink = OutputSink::new();
-
-        // When: publishing the Trade event
-        // Then: it should not panic
-        sink.publish(&trade_event);
+        }
     }
 
-    /// Test that publish is a placeholder no-op that accepts any event.
     #[test]
-    fn publish_is_placeholder_noop() {
-        // Given: various event types
-        let events = vec![
+    fn publish_accepts_each_event_variant() {
+        // Given each EngineEvent variant
+        let events = [
             EngineEvent::Accepted {
-                sequence: Sequence::new(1),
+                event_sequence: EventSequence::new(1),
+                command_sequence: CommandSequence::new(0),
                 timestamp_nanos: TimestampNanos::new(1000),
                 order_id: OrderId::new(42),
                 client_order_id: ClientOrderId::new(7),
                 account_id: AccountId::new(1),
             },
             EngineEvent::Rejected {
-                sequence: Sequence::new(2),
+                event_sequence: EventSequence::new(2),
+                command_sequence: CommandSequence::new(1),
                 timestamp_nanos: TimestampNanos::new(2000),
                 client_order_id: ClientOrderId::new(7),
                 reason: EngineEventRejectReason::InvalidQuantity,
             },
             EngineEvent::Replaced {
-                sequence: Sequence::new(3),
+                event_sequence: EventSequence::new(3),
+                command_sequence: CommandSequence::new(2),
                 timestamp_nanos: TimestampNanos::new(3000),
                 order_id: OrderId::new(42),
                 client_order_id: ClientOrderId::new(99),
             },
             EngineEvent::Canceled {
-                sequence: Sequence::new(4),
+                event_sequence: EventSequence::new(4),
+                command_sequence: CommandSequence::new(3),
                 timestamp_nanos: TimestampNanos::new(4000),
                 order_id: OrderId::new(42),
             },
-            EngineEvent::Trade {
-                sequence: Sequence::new(5),
-                timestamp_nanos: TimestampNanos::new(5000),
-                maker_order_id: OrderId::new(10),
-                taker_order_id: OrderId::new(20),
-                instrument_id: InstrumentId::new(2),
-                price: Price::new(100),
-                quantity: Quantity::new(5),
-            },
+            sample_trade(),
         ];
-
         let sink = OutputSink::new();
 
-        // When: publishing each event type
+        // When we publish each event
+        // Then the sink accepts the event
         for event in events {
-            // Then: it should not panic (no-op placeholder)
             sink.publish(&event);
         }
-    }
-
-    /// Test that OutputSink implements Default.
-    #[test]
-    fn sink_default_works() {
-        // When: creating an OutputSink using Default
-        let _sink = OutputSink;
-
-        // Then: it should be successfully created (no panic)
     }
 }

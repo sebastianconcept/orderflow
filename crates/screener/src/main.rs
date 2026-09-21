@@ -1,3 +1,7 @@
+//! Screener process entry.
+//!
+//! When this process starts, it checks one Order and exits.
+
 use engine_types::{Order, OrderId};
 use screener::Screener;
 

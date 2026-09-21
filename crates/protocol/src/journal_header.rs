@@ -1,205 +1,165 @@
-//! Journal header for protocol-encoded event logs.
+//! 15-byte session prefix of a packed journal.
 //!
-//! The journal header provides session-scoped metadata that precedes all
-//! frame-encoded commands and events in a replayable event log.
-//!
-//! # Header Layout (15 bytes, little-endian)
-//!
-//! | Offset | Size | Field |
-//! |--------|------|-------|
-//! | 0 | 4 | magic `OFL1` (`0x4F 0x46 0x4C 0x31`) |
-//! | 4 | 2 | `schema_version` = `1` |
-//! | 6 | 8 | `SessionId` (`u64`) |
-//! | 14 | 1 | `clock_kind`: `0` logical, `1` wall |
-//!
-//! # Versioning
-//!
-//! Unknown `schema_version` values cause decode to fail with an error.
-//! This ensures forward compatibility without silent misinterpretation.
+//! When a caller names the session and clock of a journal, it uses this module
+//! so magic, schema version, SessionId, and ClockKind sit before the first frame.
 //!
 //! # Examples
 //!
-//! ```ignore
-//! use protocol::{JournalHeader, SessionId};
+//! ```
+//! use engine_types::SessionId;
+//! use protocol::journal_header::{ClockKind, JournalHeader};
 //!
-//! // Create a header for session 42 with logical clock
 //! let header = JournalHeader::new(SessionId::new(42), ClockKind::Logical);
-//!
-//! // Encode to bytes
-//! let mut buf = vec![0; 15];
-//! header.encode(&mut buf);
-//!
-//! // Decode from bytes
-//! let decoded = JournalHeader::decode(&buf)?;
+//! let mut buf = [0u8; 15];
+//! header.encode(&mut buf).expect("header buffer is HEADER_SIZE");
+//! let decoded = JournalHeader::decode(&buf).expect("round-trip");
 //! assert_eq!(decoded.session_id().inner(), 42);
 //! assert_eq!(decoded.clock_kind(), ClockKind::Logical);
 //! ```
 
-/// Magic bytes that identify a valid protocol journal.
+use displaydoc::Display;
+use engine_types::SessionId;
+use thiserror::Error;
+
+/// Four-byte OFL1 identifier of a valid journal.
 const MAGIC: [u8; 4] = [0x4F, 0x46, 0x4C, 0x31]; // "OFL1"
 
-/// Current schema version for the journal format.
+/// Current journal schema version.
 const SCHEMA_VERSION: u16 = 1;
 
-/// The size of the journal header in bytes.
+/// Byte count of the journal session prefix.
 pub const HEADER_SIZE: usize = 15;
 
-/// Error types for journal header decoding.
-#[derive(thiserror::Error, Debug)]
+/// Failure of journal header decode.
+/// Wrong magic, unsupported schema version, unknown clock kind, and a short
+/// buffer are distinct.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The magic bytes do not match the expected "OFL1" marker.
-    #[error("invalid magic bytes: expected OFL1")]
+    /// Invalid magic bytes: expected OFL1
     WrongMagic,
-
-    /// The schema version is not supported (only version 1 is accepted).
-    #[error("unsupported schema version: {0} (expected 1)")]
+    /// Unsupported schema version: {0} (expected 1)
     UnsupportedSchemaVersion(u16),
-
-    /// The input buffer is too short to contain a valid header.
-    #[error("buffer too short: expected at least {expected} bytes, got {actual}")]
+    /// Unsupported clock kind: {0}
+    UnsupportedClockKind(u8),
+    /// Buffer too short: expected at least {expected} bytes, got {actual}
     BufferTooShort { expected: usize, actual: usize },
 }
 
-/// Clock kind indicating how timestamps are generated.
+/// Failure of journal header encode.
+/// The buffer must hold HEADER_SIZE bytes.
+#[derive(Display, Debug, Error, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Buffer too short: expected at least {expected} bytes, got {actual}
+    BufferTooShort { expected: usize, actual: usize },
+}
+
+/// ClockKind is how timestamps in this journal are produced.
+/// When a header names the clock, it uses this type so Logical is a session
+/// clock and Wall is wall time.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ClockKind {
-    /// Logical clock - monotonically increasing sequence numbers.
+    /// Monotonically increasing session clock.
     Logical = 0,
-    /// Wall clock - real-time timestamps in nanoseconds.
+    /// Real-time nanosecond clock.
     Wall = 1,
 }
 
 impl ClockKind {
-    /// Encode the clock kind as a u8 for wire format.
+    /// Answers the journal byte of this clock kind.
     pub fn encode(self) -> u8 {
         self as u8
     }
 
-    /// Decode a clock kind from a u8 value.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The encoded u8 value (0 for logical, 1 for wall).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(ClockKind)` - The decoded clock kind.
-    /// * `Err(DecodeError)` - If the value is not 0 or 1.
+    /// Answers the ClockKind of a journal byte.
+    /// An unknown byte is an unsupported clock kind, not a schema error.
     pub fn decode(value: u8) -> Result<Self, DecodeError> {
         match value {
             0 => Ok(ClockKind::Logical),
             1 => Ok(ClockKind::Wall),
-            _ => Err(DecodeError::UnsupportedSchemaVersion(value as u16)),
+            unknown => Err(DecodeError::UnsupportedClockKind(unknown)),
         }
     }
 }
 
-/// Journal header containing session metadata.
-///
-/// The header precedes all frame-encoded data in a journal file and
-/// provides the necessary context to interpret the session's events.
+/// JournalHeader is the 15-byte session prefix of a packed journal.
+/// When a caller names the session and clock before the first frame, it uses
+/// this type so magic, schema version, SessionId, and ClockKind are one prefix.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct JournalHeader {
-    session_id: u64,
+    session_id: SessionId,
     clock_kind: ClockKind,
 }
 
 impl JournalHeader {
-    /// Create a new journal header with the given session ID and clock kind.
-    ///
-    /// # Arguments
-    ///
-    /// * `session_id` - Unique identifier for the matching session.
-    /// * `clock_kind` - The clock source used for timestamps in this session.
-    pub fn new(session_id: u64, clock_kind: ClockKind) -> Self {
+    /// Answers a JournalHeader from a SessionId and a ClockKind.
+    pub fn new(session_id: SessionId, clock_kind: ClockKind) -> Self {
         JournalHeader {
             session_id,
             clock_kind,
         }
     }
 
-    /// Create a new journal header with logical clock.
-    ///
-    /// # Arguments
-    ///
-    /// * `session_id` - Unique identifier for the matching session.
-    pub fn new_logical(session_id: u64) -> Self {
+    /// Answers a JournalHeader that uses a logical clock.
+    pub fn new_logical(session_id: SessionId) -> Self {
         JournalHeader::new(session_id, ClockKind::Logical)
     }
 
-    /// Create a new journal header with wall clock.
-    ///
-    /// # Arguments
-    ///
-    /// * `session_id` - Unique identifier for the matching session.
-    pub fn new_wall(session_id: u64) -> Self {
+    /// Answers a JournalHeader that uses a wall clock.
+    pub fn new_wall(session_id: SessionId) -> Self {
         JournalHeader::new(session_id, ClockKind::Wall)
     }
 
-    /// Get the session identifier.
-    pub fn session_id(&self) -> u64 {
+    /// Answers the matching session that owns this journal.
+    pub fn session_id(&self) -> SessionId {
         self.session_id
     }
 
-    /// Get the clock kind.
+    /// Answers how timestamps in this journal are produced.
     pub fn clock_kind(&self) -> ClockKind {
         self.clock_kind
     }
 
-    /// Encode the header to a byte buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - A mutable byte buffer of at least [`HEADER_SIZE`] bytes.
-    pub fn encode(&self, buf: &mut [u8]) {
-        debug_assert!(buf.len() >= HEADER_SIZE);
-
-        // Magic bytes
-        buf[0..4].copy_from_slice(&MAGIC);
-        // Schema version (little-endian)
-        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        // SessionId (little-endian)
-        buf[6..14].copy_from_slice(&self.session_id.to_le_bytes());
-        // Clock kind
-        buf[14] = self.clock_kind.encode();
-    }
-
-    /// Decode a journal header from a byte slice.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - A byte slice containing a valid journal header.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(JournalHeader)` - The decoded header.
-    /// * `Err(DecodeError)` - If decoding fails (wrong magic, unsupported version,
-    ///   buffer too short).
-    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
-        if buf.len() < HEADER_SIZE {
-            return Err(DecodeError::BufferTooShort {
+    /// Answers the 15-byte prefix of this header.
+    pub fn encode(&self, buffer: &mut [u8]) -> Result<usize, EncodeError> {
+        if buffer.len() < HEADER_SIZE {
+            return Err(EncodeError::BufferTooShort {
                 expected: HEADER_SIZE,
-                actual: buf.len(),
+                actual: buffer.len(),
             });
         }
 
-        // Check magic bytes
-        let magic = [buf[0], buf[1], buf[2], buf[3]];
+        buffer[0..4].copy_from_slice(&MAGIC);
+        buffer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        buffer[6..14].copy_from_slice(&self.session_id.inner().to_le_bytes());
+        buffer[14] = self.clock_kind.encode();
+        Ok(HEADER_SIZE)
+    }
+
+    /// Answers a JournalHeader of a 15-byte prefix.
+    /// An unknown clock kind is UnsupportedClockKind, not a schema error.
+    pub fn decode(buffer: &[u8]) -> Result<Self, DecodeError> {
+        if buffer.len() < HEADER_SIZE {
+            return Err(DecodeError::BufferTooShort {
+                expected: HEADER_SIZE,
+                actual: buffer.len(),
+            });
+        }
+
+        let magic = [buffer[0], buffer[1], buffer[2], buffer[3]];
         if magic != MAGIC {
             return Err(DecodeError::WrongMagic);
         }
 
-        // Check schema version
-        let schema_version = u16::from_le_bytes([buf[4], buf[5]]);
+        let schema_version = u16::from_le_bytes([buffer[4], buffer[5]]);
         if schema_version != SCHEMA_VERSION {
             return Err(DecodeError::UnsupportedSchemaVersion(schema_version));
         }
 
-        // Decode session id and clock kind
-        let session_id = u64::from_le_bytes([
-            buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
-        ]);
-        let clock_kind = ClockKind::decode(buf[14])?;
+        let session_id = SessionId::new(u64::from_le_bytes([
+            buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11], buffer[12],
+            buffer[13],
+        ]));
+        let clock_kind = ClockKind::decode(buffer[14])?;
 
         Ok(JournalHeader {
             session_id,
@@ -212,10 +172,9 @@ impl JournalHeader {
 mod tests {
     use super::*;
 
-    /// Test that decoding rejects wrong magic bytes.
     #[test]
     fn decode_rejects_wrong_magic() {
-        // Given: a buffer with wrong magic bytes
+        // Given a buffer with wrong magic bytes
         let mut buf = [0u8; HEADER_SIZE];
         // Set wrong magic "XXXX"
         buf[0..4].copy_from_slice(b"XXXX");
@@ -226,17 +185,16 @@ mod tests {
         // Valid clock kind
         buf[14] = ClockKind::Logical.encode();
 
-        // When: we try to decode
+        // When we try to decode
         let result = JournalHeader::decode(&buf);
 
-        // Then: it returns an error about wrong magic
+        // Then it returns an error about wrong magic
         assert!(matches!(result, Err(DecodeError::WrongMagic)));
     }
 
-    /// Test that decoding rejects unsupported schema versions.
     #[test]
     fn decode_rejects_schema_version_not_one() {
-        // Given: a buffer with unsupported schema version
+        // Given a buffer with unsupported schema version
         let mut buf = [0u8; HEADER_SIZE];
         // Valid magic
         buf[0..4].copy_from_slice(&MAGIC);
@@ -247,61 +205,78 @@ mod tests {
         // Valid clock kind
         buf[14] = ClockKind::Logical.encode();
 
-        // When: we try to decode
+        // When we try to decode
         let result = JournalHeader::decode(&buf);
 
-        // Then: it returns an error about unsupported schema version
+        // Then it returns an error about unsupported schema version
         assert!(matches!(
             result,
             Err(DecodeError::UnsupportedSchemaVersion(2))
         ));
     }
 
-    /// Test that encode/decode round trips session id and clock kind.
     #[test]
     fn encode_decode_round_trips_session_id_and_clock_kind() {
-        // Given: a header with specific values
-        let original_header = JournalHeader::new(42, ClockKind::Logical);
+        // Given a header with specific values
+        let original_header = JournalHeader::new(SessionId::new(42), ClockKind::Logical);
 
-        // When: we encode and then decode
+        // When we encode and then decode
         let mut buf = [0u8; HEADER_SIZE];
-        original_header.encode(&mut buf);
+        original_header
+            .encode(&mut buf)
+            .expect("encode should succeed");
         let decoded_header = JournalHeader::decode(&buf).expect("decode should succeed");
 
-        // Then: the decoded header matches the original
-        assert_eq!(decoded_header.session_id(), 42);
+        // Then the decoded header matches the original
+        assert_eq!(decoded_header.session_id().inner(), 42);
         assert_eq!(decoded_header.clock_kind(), ClockKind::Logical);
 
         // Test with wall clock too
-        let original_wall = JournalHeader::new(999, ClockKind::Wall);
+        let original_wall = JournalHeader::new(SessionId::new(999), ClockKind::Wall);
         let mut wall_buf = [0u8; HEADER_SIZE];
-        original_wall.encode(&mut wall_buf);
+        original_wall
+            .encode(&mut wall_buf)
+            .expect("encode should succeed");
         let decoded_wall = JournalHeader::decode(&wall_buf).expect("decode should succeed");
 
-        assert_eq!(decoded_wall.session_id(), 999);
+        assert_eq!(decoded_wall.session_id().inner(), 999);
         assert_eq!(decoded_wall.clock_kind(), ClockKind::Wall);
     }
 
-    /// Test that clock kind decode rejects unknown values.
     #[test]
     fn clock_kind_decode_rejects_unknown_value() {
-        // Given: an unknown clock kind value (2)
+        // Given an unknown clock kind value (2)
         let result = ClockKind::decode(2);
 
-        // Then: it returns an error
-        assert!(result.is_err());
+        // Then it returns an error
+        assert!(matches!(result, Err(DecodeError::UnsupportedClockKind(2))));
     }
 
-    /// Test that buffer too short is rejected.
+    #[test]
+    fn decode_rejects_unknown_clock_kind_on_full_header() {
+        // Given a valid OFL1 header whose clock byte is not 0 or 1
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..4].copy_from_slice(&MAGIC);
+        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        buf[6..14].copy_from_slice(&42u64.to_le_bytes());
+        buf[14] = 2;
+
+        // When the header is decoded
+        let result = JournalHeader::decode(&buf);
+
+        // Then the error names the clock kind, not the schema version
+        assert!(matches!(result, Err(DecodeError::UnsupportedClockKind(2))));
+    }
+
     #[test]
     fn decode_rejects_buffer_too_short() {
-        // Given: a buffer with only 10 bytes
+        // Given a buffer with only 10 bytes
         let short_buf = [0u8; 10];
 
-        // When: we try to decode
+        // When we try to decode
         let result = JournalHeader::decode(&short_buf);
 
-        // Then: it returns a buffer too short error
+        // Then it returns a buffer too short error
         assert!(matches!(result, Err(DecodeError::BufferTooShort { .. })));
     }
 }
