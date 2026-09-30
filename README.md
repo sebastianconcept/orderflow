@@ -89,21 +89,23 @@ cargo clippy --all-targets --all-features
 Measure encode, decode, journal walk, and datagram ingress on the `protocol` crate. Save a baseline on the same machine you will use for later comparisons, and write the CPU model and `rustc --version` next to that save. Baselines stay under `target/` and are not committed.
 
 ```bash
-just bench                     # ~2 min: 3 command + 1 event kind × stream/datagram, 10k journal/datagram
-just bench-full                # includes journal_walk_1m (~70 MiB mixed stream, cold-cache stress)
+just bench                     # every command and event kind, stream and datagram, plus 10k walks
+just bench-full                # also journal_walk_1m (about 70 MiB mixed stream, cold-cache stress)
 just bench-save ofl1-macbook   # full bench, including journal_walk_1m; name is yours
 just bench-compare ofl1-macbook # same full bench, diffed against that name
 ```
 
 **Reading Criterion output**
 
-| Group | What it measures | How to read it |
+`thrpt` is how many of that item fit in one second. Compare it on the same machine as the saved baseline. A change in CPU or `rustc` is not a codec change.
+
+| Group | What it measures | How to read `thrpt` |
 | --- | --- | --- |
-| `encode_frame` | One frame encode: header plus fields written into the caller buffer | `thrpt` is bytes per second. `frames` is how many of that command or event the same timing writes per second. |
-| `decode_frame` | One frame decode into `Copy` types (no heap) | `thrpt` is bytes per second. `frames` is how many of that command or event the same timing parses per second. |
-| `journal_walk_10k` | Journal header + sequential frame decode + payload parse | ~50 µs total (~10 GiB/s thrpt): in-cache replay throughput. |
-| `journal_walk_1m` | Same walk on ~1M frames | ~5 ms total (~10 GiB/s): memory bandwidth / LLC miss stress; 10 samples, noisy. |
-| `datagram_ingress/10k` | 10k UDP-style datagrams decoded in a loop | Faster than stream walk per byte because there is no single contiguous journal scan. |
+| `encode_frame` | One write of each command kind and each event kind, on the stream envelope and the datagram envelope | Writes of that kind per second |
+| `decode_frame` | One parse of each command kind and each event kind, on the stream envelope and the datagram envelope | Parses of that kind per second |
+| `journal_walk_10k` | One in-cache pass over a mixed journal of 10k frames | Frames parsed per second |
+| `journal_walk_1m` | The same walk once the journal no longer fits in cache. Opt-in through `just bench-full`. Noisier than the 10k walk. | Frames parsed per second |
+| `datagram_ingress/10k` | 10k separate datagrams, each decoded on its own | Datagrams parsed per second |
 
 The `change:` block on `just bench` compares to the **previous** `cargo bench` result in `target/criterion/`, not to a named snapshot. `just bench-save` and `just bench-compare` run the full bench, including `journal_walk_1m`; `just bench` does not. Use `just bench-save <name>` once, then `just bench-compare <name>` for an intentional diff against that snapshot. Treat a timing regression as real when the median moves more than about 10% and the confidence intervals do not overlap.
 

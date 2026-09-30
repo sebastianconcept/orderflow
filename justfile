@@ -84,7 +84,8 @@ check:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test
 
-# Default: single-frame span + 10k journal/datagram (skips 1m cold-cache walk).
+# Every command and event kind, stream and datagram, plus 10k walks.
+# Skips the 1m cold-cache walk.
 bench:
     cargo bench -p protocol --bench codec -- 'encode_frame|decode_frame|journal_walk_10k|datagram_ingress'
 

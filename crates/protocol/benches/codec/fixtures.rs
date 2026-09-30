@@ -3,16 +3,16 @@
 //! When Criterion builds a journal or datagram batch, it uses this module so
 //! the timed loop receives bytes built outside the measurement window.
 
-// The allocation test calls every kind in this module. This bench calls the
-// timing span and the mixed-journal subset.
-#[allow(dead_code)]
+// The allocation test and this bench both call every kind in this module.
 #[path = "../../support/command_event_samples.rs"]
 mod command_event_samples;
 
 #[path = "../../support/mixed_journal_slot.rs"]
 mod mixed_journal_slot;
 
-pub use command_event_samples::{session_id, MAX_ENCODED_STREAM_FRAME};
+pub use command_event_samples::{
+    all_command_kinds, all_event_kinds, session_id, MAX_ENCODED_STREAM_FRAME,
+};
 
 use command_event_samples::{
     cancel_by_order_sequenced_command, new_limit_sequenced_command, rejected_engine_event,
@@ -42,27 +42,6 @@ const ESTIMATED_STREAM_FRAME_BYTES: usize = 72;
 enum JournalRecord {
     Command(SequencedCommand),
     Event(EngineEvent),
-}
-
-/// Answers command kinds that span small, typical, and heavy payloads for timing benches.
-///
-/// Other command kinds sit between these on the wire; the allocation test locks every kind.
-pub fn command_kinds_for_timing_bench() -> [(&'static str, SequencedCommand); 3] {
-    let zero = CommandSequence::new(0);
-    [
-        ("cancel_by_order", cancel_by_order_sequenced_command(zero)),
-        ("new_limit", new_limit_sequenced_command(zero)),
-        ("replace", replace_sequenced_command(zero)),
-    ]
-}
-
-/// Answers the event kind with the largest payload for timing benches.
-///
-/// Smaller events decode in the same band; the allocation test locks every kind.
-pub fn event_kinds_for_timing_bench() -> [(&'static str, EngineEvent); 1] {
-    let zero_command = CommandSequence::new(0);
-    let zero_event = EventSequence::new(0);
-    [("trade", trade_engine_event(zero_event, zero_command))]
 }
 
 /// Answers the mixed-journal record at `index`.
