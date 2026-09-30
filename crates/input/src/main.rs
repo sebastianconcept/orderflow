@@ -1,3 +1,7 @@
+//! Input process entry.
+//!
+//! When this process starts, it polls InputGateway once and exits.
+
 use input::InputGateway;
 
 fn main() {

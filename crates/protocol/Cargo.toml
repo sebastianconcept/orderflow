@@ -3,4 +3,17 @@ name = "protocol"
 version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-Proprietary"
+autobenches = false
+
 [dependencies]
+displaydoc = "0.2"
+thiserror = "1.0"
+engine-types = { path = "../engine-types" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "codec"
+path = "benches/codec/main.rs"
+harness = false

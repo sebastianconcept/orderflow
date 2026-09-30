@@ -37,3 +37,5 @@ tarpaulin-report.html
 # Replay / simulation outputs (generated; keep fixtures under scenarios/ tracked)
 scenarios/generated/
 replay/out/
+
+.ai-squads/

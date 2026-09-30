@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-Proprietary"
 [dependencies]
-engine-gloomio = { path = "../engine-gloomio" }
 engine-tokio = { path = "../engine-tokio" }
+engine-types = { path = "../engine-types" }

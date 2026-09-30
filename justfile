@@ -83,3 +83,19 @@ check:
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test
+
+# Every command and event kind, stream and datagram, plus 10k walks.
+# Skips the 1m cold-cache walk.
+bench:
+    cargo bench -p protocol --bench codec -- 'encode_frame|decode_frame|journal_walk_10k|datagram_ingress'
+
+bench-full:
+    cargo bench -p protocol --bench codec
+
+# Save a named Criterion baseline under target/criterion/ (not committed).
+bench-save name:
+    cargo bench -p protocol --bench codec -- --save-baseline {{name}}
+
+# Compare this run to a named baseline from bench-save.
+bench-compare name:
+    cargo bench -p protocol --bench codec -- --baseline {{name}}

@@ -1,3 +1,7 @@
+//! Output process entry.
+//!
+//! When this process starts, it constructs an OutputSink and exits.
+
 use output::OutputSink;
 
 fn main() {
