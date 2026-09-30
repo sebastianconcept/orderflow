@@ -31,15 +31,18 @@ pub enum EncodeError {
     BufferTooShort { expected: usize, actual: usize },
 }
 
-/// Answers a packed datagram of SessionId, JournalSequence, kind, and payload.
-pub fn encode(
+/// Answers the payload region after writing SessionId, JournalSequence, and kind.
+///
+/// When a command or event codec writes fields at fixed offsets, it uses this
+/// function so the datagram header sits in front of that region.
+pub(crate) fn encode_header(
     session_id: SessionId,
     journal_sequence: JournalSequence,
     kind: FrameKind,
-    payload: &[u8],
+    payload_len: usize,
     buffer: &mut [u8],
-) -> Result<usize, EncodeError> {
-    let total_len = DATAGRAM_HEADER_SIZE + payload.len();
+) -> Result<&mut [u8], EncodeError> {
+    let total_len = DATAGRAM_HEADER_SIZE + payload_len;
     if buffer.len() < total_len {
         return Err(EncodeError::BufferTooShort {
             expected: total_len,
@@ -49,10 +52,21 @@ pub fn encode(
     buffer[0..8].copy_from_slice(&session_id.inner().to_le_bytes());
     buffer[8..16].copy_from_slice(&journal_sequence.inner().to_le_bytes());
     buffer[16] = kind.encode();
-    if !payload.is_empty() {
-        buffer[17..total_len].copy_from_slice(payload);
-    }
-    Ok(total_len)
+    Ok(&mut buffer[DATAGRAM_HEADER_SIZE..total_len])
+}
+
+/// Writes a packed datagram of SessionId, JournalSequence, kind, and payload into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the datagram.
+pub fn encode(
+    session_id: SessionId,
+    journal_sequence: JournalSequence,
+    kind: FrameKind,
+    payload: &[u8],
+    buffer: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let payload_region = encode_header(session_id, journal_sequence, kind, payload.len(), buffer)?;
+    payload_region.copy_from_slice(payload);
+    Ok(DATAGRAM_HEADER_SIZE + payload.len())
 }
 
 /// Answers the SessionId, JournalSequence, kind, and payload of a packed datagram.
@@ -78,7 +92,8 @@ pub fn decode(
     Ok((session_id, journal_sequence, kind, payload))
 }
 
-/// Answers a packed datagram of a Heartbeat control frame with empty payload.
+/// Writes a Heartbeat datagram with an empty payload into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the datagram.
 pub fn encode_heartbeat(
     session_id: SessionId,
     journal_sequence: JournalSequence,

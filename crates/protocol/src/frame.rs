@@ -160,18 +160,21 @@ impl<'a> Frame<'a> {
         FRAME_HEADER_SIZE + payload_len
     }
 
-    /// Answers a packed stream frame of a kind, JournalSequence, and payload.
-    pub fn encode(
+    /// Answers the payload region after writing frame_len, kind, and JournalSequence.
+    ///
+    /// When a command or event codec writes fields at fixed offsets, it uses this
+    /// function so the header sits in front of that region. frame_len is the
+    /// content after the length prefix, not the full encoded size.
+    pub(crate) fn encode_header(
         kind: FrameKind,
         journal_sequence: JournalSequence,
-        payload: &[u8],
+        payload_len: usize,
         buffer: &mut [u8],
-    ) -> Result<usize, EncodeError> {
-        let total_len = FRAME_HEADER_SIZE + payload.len();
-        // frame_len is the content after the length prefix, not the full encoded size.
-        let content_len = 1usize.saturating_add(8).saturating_add(payload.len());
+    ) -> Result<&mut [u8], EncodeError> {
+        let total_len = FRAME_HEADER_SIZE + payload_len;
+        let content_len = 1usize.saturating_add(8).saturating_add(payload_len);
         if content_len > u16::MAX as usize {
-            return Err(EncodeError::PayloadTooLarge(payload.len()));
+            return Err(EncodeError::PayloadTooLarge(payload_len));
         }
         if buffer.len() < total_len {
             return Err(EncodeError::BufferTooShort {
@@ -184,10 +187,20 @@ impl<'a> Frame<'a> {
         buffer[0..2].copy_from_slice(&frame_len.to_le_bytes());
         buffer[2] = kind.encode();
         buffer[3..11].copy_from_slice(&journal_sequence.inner().to_le_bytes());
-        if !payload.is_empty() {
-            buffer[11..total_len].copy_from_slice(payload);
-        }
-        Ok(total_len)
+        Ok(&mut buffer[FRAME_HEADER_SIZE..total_len])
+    }
+
+    /// Writes a packed stream frame of a kind, JournalSequence, and payload into `buffer`.
+    /// Answers the number of bytes written, or an encode error when `buffer` cannot hold the frame.
+    pub fn encode(
+        kind: FrameKind,
+        journal_sequence: JournalSequence,
+        payload: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        let payload_region = Self::encode_header(kind, journal_sequence, payload.len(), buffer)?;
+        payload_region.copy_from_slice(payload);
+        Ok(FRAME_HEADER_SIZE + payload.len())
     }
 
     /// Answers the kind, JournalSequence, and payload of a packed stream frame.

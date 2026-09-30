@@ -37,12 +37,13 @@ use thiserror::Error;
 
 use crate::datagram::{
     self, DecodeError as DatagramDecodeError, EncodeError as DatagramEncodeError,
+    DATAGRAM_HEADER_SIZE,
 };
 use crate::frame::{
     DecodeError as FrameDecodeError, EncodeError as FrameEncodeError, Frame, FrameKind,
     FRAME_HEADER_SIZE,
 };
-use crate::packed_le::{read_i64, read_u128, read_u64};
+use crate::packed_le::{read_i64, read_u128, read_u64, write_i64, write_u128, write_u64};
 
 /// Failure of event frame decode.
 /// Frame errors, datagram errors, unknown kinds, and payload mismatches stay
@@ -75,6 +76,17 @@ pub enum EncodeError {
     Datagram(#[source] DatagramEncodeError),
 }
 
+/// Byte count of an Accepted payload: event, command, timestamp, order, client, account.
+const ACCEPTED_PAYLOAD_LEN: usize = 48;
+/// Byte count of a Rejected payload: event, command, timestamp, client, reason.
+const REJECTED_PAYLOAD_LEN: usize = 33;
+/// Byte count of a Replaced payload: event, command, timestamp, order, client.
+const REPLACED_PAYLOAD_LEN: usize = 40;
+/// Byte count of a Canceled payload: event, command, timestamp, order.
+const CANCELED_PAYLOAD_LEN: usize = 32;
+/// Byte count of a Trade payload: event, command, timestamp, maker, taker, instrument, price, quantity.
+const TRADE_PAYLOAD_LEN: usize = 72;
+
 /// Answers the FrameKind of an EngineEvent variant.
 fn frame_kind_for_event(event: &EngineEvent) -> FrameKind {
     match event {
@@ -86,10 +98,22 @@ fn frame_kind_for_event(event: &EngineEvent) -> FrameKind {
     }
 }
 
-/// Answers the shared packed payload of an EngineEvent.
-/// Stream and datagram envelopes wrap these bytes.
-pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
-    let mut payload = Vec::new();
+/// Answers the payload length of an EngineEvent variant.
+fn event_payload_len(event: &EngineEvent) -> usize {
+    match event {
+        EngineEvent::Accepted { .. } => ACCEPTED_PAYLOAD_LEN,
+        EngineEvent::Rejected { .. } => REJECTED_PAYLOAD_LEN,
+        EngineEvent::Replaced { .. } => REPLACED_PAYLOAD_LEN,
+        EngineEvent::Canceled { .. } => CANCELED_PAYLOAD_LEN,
+        EngineEvent::Trade { .. } => TRADE_PAYLOAD_LEN,
+    }
+}
+
+/// Writes the shared packed payload of an EngineEvent into `payload`.
+///
+/// When encode has already reserved the exact payload region, it uses this
+/// function so stream and datagram frames share one field layout.
+fn write_event_payload(event: &EngineEvent, payload: &mut [u8]) {
     match event {
         EngineEvent::Accepted {
             event_sequence,
@@ -99,12 +123,12 @@ pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             client_order_id,
             account_id,
         } => {
-            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
-            payload.extend_from_slice(&order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&account_id.inner().to_le_bytes());
+            write_u64(payload, 0, event_sequence.inner());
+            write_u64(payload, 8, command_sequence.inner());
+            write_u64(payload, 16, timestamp_nanos.inner());
+            write_u64(payload, 24, order_id.inner());
+            write_u64(payload, 32, client_order_id.inner());
+            write_u64(payload, 40, account_id.inner());
         }
         EngineEvent::Rejected {
             event_sequence,
@@ -113,11 +137,11 @@ pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             client_order_id,
             reason,
         } => {
-            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-            payload.push(encode_rejection_reason(reason));
+            write_u64(payload, 0, event_sequence.inner());
+            write_u64(payload, 8, command_sequence.inner());
+            write_u64(payload, 16, timestamp_nanos.inner());
+            write_u64(payload, 24, client_order_id.inner());
+            payload[32] = encode_rejection_reason(reason);
         }
         EngineEvent::Replaced {
             event_sequence,
@@ -126,11 +150,11 @@ pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             order_id,
             client_order_id,
         } => {
-            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
-            payload.extend_from_slice(&order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
+            write_u64(payload, 0, event_sequence.inner());
+            write_u64(payload, 8, command_sequence.inner());
+            write_u64(payload, 16, timestamp_nanos.inner());
+            write_u64(payload, 24, order_id.inner());
+            write_u64(payload, 32, client_order_id.inner());
         }
         EngineEvent::Canceled {
             event_sequence,
@@ -138,10 +162,10 @@ pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             timestamp_nanos,
             order_id,
         } => {
-            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
-            payload.extend_from_slice(&order_id.inner().to_le_bytes());
+            write_u64(payload, 0, event_sequence.inner());
+            write_u64(payload, 8, command_sequence.inner());
+            write_u64(payload, 16, timestamp_nanos.inner());
+            write_u64(payload, 24, order_id.inner());
         }
         EngineEvent::Trade {
             event_sequence,
@@ -153,16 +177,24 @@ pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
             price,
             quantity,
         } => {
-            payload.extend_from_slice(&event_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&command_sequence.inner().to_le_bytes());
-            payload.extend_from_slice(&timestamp_nanos.inner().to_le_bytes());
-            payload.extend_from_slice(&maker_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&taker_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&instrument_id.inner().to_le_bytes());
-            payload.extend_from_slice(&price.inner().to_le_bytes());
-            payload.extend_from_slice(&quantity.inner().to_le_bytes());
+            write_u64(payload, 0, event_sequence.inner());
+            write_u64(payload, 8, command_sequence.inner());
+            write_u64(payload, 16, timestamp_nanos.inner());
+            write_u64(payload, 24, maker_order_id.inner());
+            write_u64(payload, 32, taker_order_id.inner());
+            write_u64(payload, 40, instrument_id.inner());
+            write_i64(payload, 48, price.inner());
+            write_u128(payload, 56, quantity.inner());
         }
     }
+}
+
+/// Answers an owned copy of the EngineEvent payload, detached from a frame buffer.
+/// The copy matches the payload bytes stream and datagram encode store in the caller buffer.
+pub fn encode_event_payload(event: &EngineEvent) -> Vec<u8> {
+    let payload_len = event_payload_len(event);
+    let mut payload = vec![0u8; payload_len];
+    write_event_payload(event, &mut payload);
     payload
 }
 
@@ -190,15 +222,19 @@ fn decode_rejection_reason(value: u8) -> Result<EngineEventRejectReason, DecodeE
     }
 }
 
-/// Answers a packed stream frame of an EngineEvent.
+/// Writes the packed stream frame of an EngineEvent into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the frame.
 pub fn encode_event(
     event: &EngineEvent,
     journal_sequence: JournalSequence,
     buffer: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let kind = frame_kind_for_event(event);
-    let payload = encode_event_payload(event);
-    Frame::encode(kind, journal_sequence, &payload, buffer).map_err(EncodeError::Frame)
+    let payload_len = event_payload_len(event);
+    let payload_region = Frame::encode_header(kind, journal_sequence, payload_len, buffer)
+        .map_err(EncodeError::Frame)?;
+    write_event_payload(event, payload_region);
+    Ok(FRAME_HEADER_SIZE + payload_len)
 }
 
 /// Answers an EngineEvent of a shared event payload.
@@ -229,7 +265,8 @@ pub fn decode_event(buffer: &[u8]) -> Result<(EngineEvent, JournalSequence, usiz
     Ok((event, journal_sequence, consumed))
 }
 
-/// Answers a packed datagram of an EngineEvent.
+/// Writes the packed datagram of an EngineEvent into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the datagram.
 pub fn encode_event_datagram(
     event: &EngineEvent,
     session_id: SessionId,
@@ -237,9 +274,12 @@ pub fn encode_event_datagram(
     buffer: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let kind = frame_kind_for_event(event);
-    let payload = encode_event_payload(event);
-    datagram::encode(session_id, journal_sequence, kind, &payload, buffer)
-        .map_err(EncodeError::Datagram)
+    let payload_len = event_payload_len(event);
+    let payload_region =
+        datagram::encode_header(session_id, journal_sequence, kind, payload_len, buffer)
+            .map_err(EncodeError::Datagram)?;
+    write_event_payload(event, payload_region);
+    Ok(DATAGRAM_HEADER_SIZE + payload_len)
 }
 
 /// Answers an EngineEvent of a packed datagram.
@@ -262,11 +302,10 @@ pub fn decode_event_datagram(
 /// Answers an EngineEvent::Accepted of a payload, or a length mismatch when the
 /// payload is not exactly 48 bytes.
 fn decode_accepted(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 48;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != ACCEPTED_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Accepted.encode(),
-            expected: EXPECTED_LEN,
+            expected: ACCEPTED_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -283,11 +322,10 @@ fn decode_accepted(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
 /// Answers an EngineEvent::Rejected of a payload, or a length mismatch when the
 /// payload is not exactly 33 bytes.
 fn decode_rejected(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 33;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != REJECTED_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Rejected.encode(),
-            expected: EXPECTED_LEN,
+            expected: REJECTED_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -303,11 +341,10 @@ fn decode_rejected(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
 /// Answers an EngineEvent::Replaced of a payload, or a length mismatch when the
 /// payload is not exactly 40 bytes.
 fn decode_replaced(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 40;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != REPLACED_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Replaced.encode(),
-            expected: EXPECTED_LEN,
+            expected: REPLACED_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -323,11 +360,10 @@ fn decode_replaced(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
 /// Answers an EngineEvent::Canceled of a payload, or a length mismatch when the
 /// payload is not exactly 32 bytes.
 fn decode_canceled(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 32;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != CANCELED_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Canceled.encode(),
-            expected: EXPECTED_LEN,
+            expected: CANCELED_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -342,11 +378,10 @@ fn decode_canceled(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
 /// Answers an EngineEvent::Trade of a payload, or a length mismatch when the
 /// payload is not exactly 72 bytes.
 fn decode_trade(payload: &[u8]) -> Result<EngineEvent, DecodeError> {
-    const EXPECTED_LEN: usize = 72;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != TRADE_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Trade.encode(),
-            expected: EXPECTED_LEN,
+            expected: TRADE_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }

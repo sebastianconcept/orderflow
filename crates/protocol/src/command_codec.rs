@@ -44,12 +44,13 @@ use thiserror::Error;
 
 use crate::datagram::{
     self, DecodeError as DatagramDecodeError, EncodeError as DatagramEncodeError,
+    DATAGRAM_HEADER_SIZE,
 };
 use crate::frame::{
     DecodeError as FrameDecodeError, EncodeError as FrameEncodeError, Frame, FrameKind,
     FRAME_HEADER_SIZE,
 };
-use crate::packed_le::{read_i64, read_u128, read_u64};
+use crate::packed_le::{read_i64, read_u128, read_u64, write_i64, write_u128, write_u64};
 
 /// Failure of command frame decode.
 /// Frame errors, datagram errors, unknown kinds, and payload mismatches stay
@@ -82,11 +83,34 @@ pub enum EncodeError {
     Datagram(#[source] DatagramEncodeError),
 }
 
-/// Answers the shared packed payload of a SequencedCommand.
-/// Stream and datagram envelopes wrap these bytes.
-pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&sequenced.command_sequence().inner().to_le_bytes());
+/// Byte count of a NewLimit payload: command_sequence, account, client, instrument, side, price, quantity.
+const NEW_LIMIT_PAYLOAD_LEN: usize = 57;
+/// Byte count of a NewMarket payload: command_sequence, account, client, instrument, side, quantity.
+const NEW_MARKET_PAYLOAD_LEN: usize = 49;
+/// Byte count of a CancelByOrder payload: command_sequence and order_id.
+const CANCEL_BY_ORDER_PAYLOAD_LEN: usize = 16;
+/// Byte count of a CancelByClient payload: command_sequence, account, and client.
+const CANCEL_BY_CLIENT_PAYLOAD_LEN: usize = 24;
+/// Byte count of a Replace payload: command_sequence, order_id, client, price, quantity.
+const REPLACE_PAYLOAD_LEN: usize = 48;
+
+/// Answers the payload length of an EngineCommand variant.
+fn command_payload_len(command: &EngineCommand) -> usize {
+    match command {
+        EngineCommand::NewLimit { .. } => NEW_LIMIT_PAYLOAD_LEN,
+        EngineCommand::NewMarket { .. } => NEW_MARKET_PAYLOAD_LEN,
+        EngineCommand::CancelByOrder { .. } => CANCEL_BY_ORDER_PAYLOAD_LEN,
+        EngineCommand::CancelByClient { .. } => CANCEL_BY_CLIENT_PAYLOAD_LEN,
+        EngineCommand::Replace { .. } => REPLACE_PAYLOAD_LEN,
+    }
+}
+
+/// Writes the shared packed payload of a SequencedCommand into `payload`.
+///
+/// When encode has already reserved the exact payload region, it uses this
+/// function so stream and datagram frames share one field layout.
+fn write_command_payload(sequenced: &SequencedCommand, payload: &mut [u8]) {
+    write_u64(payload, 0, sequenced.command_sequence().inner());
     match sequenced.command() {
         EngineCommand::NewLimit {
             account_id,
@@ -96,12 +120,12 @@ pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
             price,
             quantity,
         } => {
-            payload.extend_from_slice(&account_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&instrument_id.inner().to_le_bytes());
-            payload.push(encode_side(side));
-            payload.extend_from_slice(&price.inner().to_le_bytes());
-            payload.extend_from_slice(&quantity.inner().to_le_bytes());
+            write_u64(payload, 8, account_id.inner());
+            write_u64(payload, 16, client_order_id.inner());
+            write_u64(payload, 24, instrument_id.inner());
+            payload[32] = encode_side(side);
+            write_i64(payload, 33, price.inner());
+            write_u128(payload, 41, quantity.inner());
         }
         EngineCommand::NewMarket {
             account_id,
@@ -110,21 +134,21 @@ pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
             side,
             quantity,
         } => {
-            payload.extend_from_slice(&account_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&instrument_id.inner().to_le_bytes());
-            payload.push(encode_side(side));
-            payload.extend_from_slice(&quantity.inner().to_le_bytes());
+            write_u64(payload, 8, account_id.inner());
+            write_u64(payload, 16, client_order_id.inner());
+            write_u64(payload, 24, instrument_id.inner());
+            payload[32] = encode_side(side);
+            write_u128(payload, 33, quantity.inner());
         }
         EngineCommand::CancelByOrder { order_id } => {
-            payload.extend_from_slice(&order_id.inner().to_le_bytes());
+            write_u64(payload, 8, order_id.inner());
         }
         EngineCommand::CancelByClient {
             account_id,
             client_order_id,
         } => {
-            payload.extend_from_slice(&account_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
+            write_u64(payload, 8, account_id.inner());
+            write_u64(payload, 16, client_order_id.inner());
         }
         EngineCommand::Replace {
             order_id,
@@ -132,12 +156,20 @@ pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
             price,
             quantity,
         } => {
-            payload.extend_from_slice(&order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&client_order_id.inner().to_le_bytes());
-            payload.extend_from_slice(&price.inner().to_le_bytes());
-            payload.extend_from_slice(&quantity.inner().to_le_bytes());
+            write_u64(payload, 8, order_id.inner());
+            write_u64(payload, 16, client_order_id.inner());
+            write_i64(payload, 24, price.inner());
+            write_u128(payload, 32, quantity.inner());
         }
     }
+}
+
+/// Answers an owned copy of the SequencedCommand payload, detached from a frame buffer.
+/// The copy matches the payload bytes stream and datagram encode store in the caller buffer.
+pub fn encode_command_payload(sequenced: &SequencedCommand) -> Vec<u8> {
+    let payload_len = command_payload_len(&sequenced.command());
+    let mut payload = vec![0u8; payload_len];
+    write_command_payload(sequenced, &mut payload);
     payload
 }
 
@@ -169,15 +201,19 @@ fn frame_kind_for_command(command: &EngineCommand) -> FrameKind {
     }
 }
 
-/// Answers a packed stream frame of a SequencedCommand.
+/// Writes the packed stream frame of a SequencedCommand into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the frame.
 pub fn encode_command(
     sequenced: &SequencedCommand,
     journal_sequence: JournalSequence,
     buffer: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let kind = frame_kind_for_command(&sequenced.command());
-    let payload = encode_command_payload(sequenced);
-    Frame::encode(kind, journal_sequence, &payload, buffer).map_err(EncodeError::Frame)
+    let payload_len = command_payload_len(&sequenced.command());
+    let payload_region = Frame::encode_header(kind, journal_sequence, payload_len, buffer)
+        .map_err(EncodeError::Frame)?;
+    write_command_payload(sequenced, payload_region);
+    Ok(FRAME_HEADER_SIZE + payload_len)
 }
 
 /// Answers a SequencedCommand of a shared command payload.
@@ -214,7 +250,8 @@ pub fn decode_command(
     Ok((sequenced, journal_sequence, consumed))
 }
 
-/// Answers a packed datagram of a SequencedCommand.
+/// Writes the packed datagram of a SequencedCommand into `buffer`.
+/// Answers the number of bytes written, or an encode error when `buffer` cannot hold the datagram.
 pub fn encode_command_datagram(
     sequenced: &SequencedCommand,
     session_id: SessionId,
@@ -222,9 +259,12 @@ pub fn encode_command_datagram(
     buffer: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let kind = frame_kind_for_command(&sequenced.command());
-    let payload = encode_command_payload(sequenced);
-    datagram::encode(session_id, journal_sequence, kind, &payload, buffer)
-        .map_err(EncodeError::Datagram)
+    let payload_len = command_payload_len(&sequenced.command());
+    let payload_region =
+        datagram::encode_header(session_id, journal_sequence, kind, payload_len, buffer)
+            .map_err(EncodeError::Datagram)?;
+    write_command_payload(sequenced, payload_region);
+    Ok(DATAGRAM_HEADER_SIZE + payload_len)
 }
 
 /// Answers a SequencedCommand of a packed datagram.
@@ -245,14 +285,12 @@ pub fn decode_command_datagram(
 }
 
 /// Answers a SequencedCommand of a NewLimit payload, or a length mismatch when
-/// the payload is not exactly 57 bytes.
+/// the payload is not exactly 57 bytes (NEW_LIMIT_PAYLOAD_LEN).
 fn decode_new_limit(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
-    // command_sequence(8) + account(8) + client(8) + instrument(8) + side(1) + price(8) + quantity(16)
-    const EXPECTED_LEN: usize = 57;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != NEW_LIMIT_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::NewLimit.encode(),
-            expected: EXPECTED_LEN,
+            expected: NEW_LIMIT_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -274,12 +312,10 @@ fn decode_new_limit(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
 /// Answers a SequencedCommand of a NewMarket payload, or a length mismatch when
 /// the payload is not exactly 49 bytes.
 fn decode_new_market(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
-    // command_sequence(8) + account(8) + client(8) + instrument(8) + side(1) + quantity(16)
-    const EXPECTED_LEN: usize = 49;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != NEW_MARKET_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::NewMarket.encode(),
-            expected: EXPECTED_LEN,
+            expected: NEW_MARKET_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -300,11 +336,10 @@ fn decode_new_market(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
 /// Answers a SequencedCommand of a CancelByOrder payload, or a length mismatch
 /// when the payload is not exactly 16 bytes.
 fn decode_cancel_by_order(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 16;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != CANCEL_BY_ORDER_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::CancelByOrder.encode(),
-            expected: EXPECTED_LEN,
+            expected: CANCEL_BY_ORDER_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -319,11 +354,10 @@ fn decode_cancel_by_order(payload: &[u8]) -> Result<SequencedCommand, DecodeErro
 /// Answers a SequencedCommand of a CancelByClient payload, or a length mismatch
 /// when the payload is not exactly 24 bytes.
 fn decode_cancel_by_client(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 24;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != CANCEL_BY_CLIENT_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::CancelByClient.encode(),
-            expected: EXPECTED_LEN,
+            expected: CANCEL_BY_CLIENT_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }
@@ -339,11 +373,10 @@ fn decode_cancel_by_client(payload: &[u8]) -> Result<SequencedCommand, DecodeErr
 /// Answers a SequencedCommand of a Replace payload, or a length mismatch when
 /// the payload is not exactly 48 bytes.
 fn decode_replace(payload: &[u8]) -> Result<SequencedCommand, DecodeError> {
-    const EXPECTED_LEN: usize = 48;
-    if payload.len() != EXPECTED_LEN {
+    if payload.len() != REPLACE_PAYLOAD_LEN {
         return Err(DecodeError::PayloadLengthMismatch {
             kind: FrameKind::Replace.encode(),
-            expected: EXPECTED_LEN,
+            expected: REPLACE_PAYLOAD_LEN,
             actual: payload.len(),
         });
     }

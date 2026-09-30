@@ -84,6 +84,31 @@ cargo fmt
 cargo clippy --all-targets --all-features
 ```
 
+### OFL1 codec reference
+
+Measure encode, decode, journal walk, and datagram ingress on the `protocol` crate. Save a baseline on the same machine you will use for later comparisons, and write the CPU model and `rustc --version` next to that save. Baselines stay under `target/` and are not committed.
+
+```bash
+just bench                     # ~2 min: 3 command + 1 event kind × stream/datagram, 10k journal/datagram
+just bench-full                # includes journal_walk_1m (~70 MiB mixed stream, cold-cache stress)
+just bench-save ofl1-macbook   # full bench, including journal_walk_1m; name is yours
+just bench-compare ofl1-macbook # same full bench, diffed against that name
+```
+
+**Reading Criterion output**
+
+| Group | What it measures | How to read it |
+| --- | --- | --- |
+| `encode_frame` | One frame encode: header plus fields written into the caller buffer | `thrpt` is bytes per second. `frames` is how many of that command or event the same timing writes per second. |
+| `decode_frame` | One frame decode into `Copy` types (no heap) | `thrpt` is bytes per second. `frames` is how many of that command or event the same timing parses per second. |
+| `journal_walk_10k` | Journal header + sequential frame decode + payload parse | ~50 µs total (~10 GiB/s thrpt): in-cache replay throughput. |
+| `journal_walk_1m` | Same walk on ~1M frames | ~5 ms total (~10 GiB/s): memory bandwidth / LLC miss stress; 10 samples, noisy. |
+| `datagram_ingress/10k` | 10k UDP-style datagrams decoded in a loop | Faster than stream walk per byte because there is no single contiguous journal scan. |
+
+The `change:` block on `just bench` compares to the **previous** `cargo bench` result in `target/criterion/`, not to a named snapshot. `just bench-save` and `just bench-compare` run the full bench, including `journal_walk_1m`; `just bench` does not. Use `just bench-save <name>` once, then `just bench-compare <name>` for an intentional diff against that snapshot. Treat a timing regression as real when the median moves more than about 10% and the confidence intervals do not overlap.
+
+Heap use is an exact gate: `cargo test -p protocol --test alloc_budget` (every command and event kind encodes and decodes with zero allocations).
+
 ## Documentation
 
 Project planning and architecture docs (ai-squads) live outside this repo:
